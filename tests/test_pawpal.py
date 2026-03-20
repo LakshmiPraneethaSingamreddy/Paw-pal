@@ -1,0 +1,71 @@
+from datetime import date, time
+
+from pawpal_system import AvailabilityWindow, CareTask, Pet, PetCareApp, TaskCategory
+
+
+def _build_owner_with_pet(app: PetCareApp):
+	owner = app.create_owner_profile()
+	today = date.today()
+	owner.availability_windows.append(
+		AvailabilityWindow(
+			day_of_week=today.weekday(),
+			start_time=time(hour=6, minute=0),
+			end_time=time(hour=22, minute=0),
+		)
+	)
+
+	pet = Pet(name="Buddy", species="Dog", age_years=4, weight_kg=24.0)
+	app.save_pet_info(owner.owner_id, pet)
+	return owner, pet, today
+
+
+def test_mark_task_completion_updates_schedule_item_status():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Morning Walk",
+			category=TaskCategory.WALKING,
+			duration_min=30,
+			priority=9,
+			earliest_start=time(hour=7, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert schedule.items
+
+	item_id = schedule.items[0].item_id
+	assert schedule.items[0].completed is False
+	assert schedule.items[0].completed_at is None
+
+	app.mark_task_completion(owner.owner_id, today, item_id, completed=True)
+
+	updated_schedule = app.schedules_by_owner_date[(owner.owner_id, today)]
+	updated_item = next(item for item in updated_schedule.items if item.item_id == item_id)
+	assert updated_item.completed is True
+	assert updated_item.completed_at is not None
+
+
+def test_add_task_increases_pet_task_count():
+	app = PetCareApp()
+	owner, pet, _ = _build_owner_with_pet(app)
+
+	initial_count = len(pet.tasks)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=15,
+			priority=10,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=30),
+		),
+	)
+
+	assert len(pet.tasks) == initial_count + 1
