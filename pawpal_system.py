@@ -623,16 +623,9 @@ class SchedulerService:
 			for task in pet.tasks:
 				all_tasks.append((pet.pet_id, task))
 
-		filtered_tasks = self.apply_constraints(
-			[t for _, t in all_tasks],
-			owner,
-			schedule_date,
-		)
-
-		task_order = {task.task_id: idx for idx, task in enumerate(filtered_tasks)}
-		ordered_pairs = sorted(
-			[(pet_id, task) for pet_id, task in all_tasks if task.task_id in task_order],
-			key=lambda pair: task_order[pair[1].task_id],
+		day_windows = sorted(
+			[window for window in owner.availability_windows if window.day_of_week == schedule_date.weekday()],
+			key=lambda window: window.start_time or time(hour=0, minute=0),
 		)
 
 		schedule = DailySchedule(
@@ -640,36 +633,372 @@ class SchedulerService:
 			status=ScheduleStatus.DRAFT,
 		)
 
-		current_dt = datetime.combine(schedule_date, time(hour=8, minute=0))
-		for pet_id, task in ordered_pairs:
-			if task.earliest_start is not None:
-				earliest_dt = datetime.combine(schedule_date, task.earliest_start)
-				if current_dt < earliest_dt:
-					current_dt = earliest_dt
+		if not day_windows:
+			schedule.explanations = [
+				PlanExplanation(
+					message="No availability windows found for this day",
+					rule_applied="availability_required",
+					impact_score=1.0,
+				)
+			]
+			self.explanations_by_schedule_id[schedule.schedule_id] = schedule.explanations
+			return schedule
 
-			end_dt = current_dt + timedelta(minutes=max(task.duration_min, 0))
+		filtered_tasks = self.apply_constraints(
+			[t for _, t in all_tasks],
+			owner,
+			schedule_date,
+		)
+		filtered_task_ids = {task.task_id for task in filtered_tasks}
+
+		def ordering_key(pair: tuple[UUID, CareTask]) -> tuple[bool, int, time, time]:
+			task = pair[1]
+			latest_end = task.latest_end or time(hour=23, minute=59)
+			earliest_start = task.earliest_start or time(hour=0, minute=0)
+			return (task.is_flexible, -task.priority, latest_end, earliest_start)
+
+		candidate_pairs = [
+			(pet_id, task)
+			for pet_id, task in all_tasks
+			if task.task_id in filtered_task_ids
+		]
+		candidate_pairs.sort(key=ordering_key)
+
+		explanations: list[PlanExplanation] = []
+		skipped_count = 0
+		for pet_id, task in candidate_pairs:
+			slot, decision_reason, removed_tasks, deferred_tasks = self._try_schedule_with_backtracking(
+				task, pet_id, schedule_date, day_windows, schedule.items
+			)
+			if slot is None:
+				skipped_count += 1
+				explanations.append(
+					PlanExplanation(
+						message=(
+							f"Skipped '{task.title}' (priority {task.priority}, duration {task.duration_min} min, "
+							f"flexible={task.is_flexible}): {decision_reason}"
+						),
+						rule_applied="task_skipped_no_feasible_slot",
+						impact_score=0.9,
+					)
+				)
+				continue
+
+			start_dt, end_dt = slot
 			schedule.items.append(
 				ScheduleItem(
-					start_time=current_dt,
+					start_time=start_dt,
 					end_time=end_dt,
-					reason_code="priority_and_constraints",
+					reason_code=decision_reason,
 					task=task,
 					pet_id=pet_id,
 				)
 			)
+			schedule.items.sort(key=lambda item: item.start_time or datetime.combine(schedule_date, time(hour=0)))
 			schedule.total_planned_min += max(task.duration_min, 0)
-			current_dt = end_dt
+			
+			if removed_tasks:
+				removed_titles = ", ".join([rt.task.title if rt.task else "unknown" for rt in removed_tasks])
+				explanations.append(
+					PlanExplanation(
+						message=(
+							f"Placed '{task.title}' from {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} "
+							f"(priority {task.priority}, flexible={task.is_flexible}) by removing lower-priority tasks: {removed_titles}"
+						),
+						rule_applied="task_placed_with_backtracking",
+						impact_score=0.75,
+					)
+				)
+			elif deferred_tasks:
+				deferred_titles = ", ".join([dt.task.title if dt.task else "unknown" for dt in deferred_tasks])
+				explanations.append(
+					PlanExplanation(
+						message=(
+							f"Placed '{task.title}' from {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} "
+							f"(priority {task.priority}, flexible={task.is_flexible}) by deferring flexible tasks: {deferred_titles}"
+						),
+						rule_applied="task_placed_with_deferral",
+						impact_score=0.7,
+					)
+				)
+			else:
+				explanations.append(
+					PlanExplanation(
+						message=(
+							f"Placed '{task.title}' from {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} "
+							f"(priority {task.priority}, flexible={task.is_flexible}): {decision_reason}"
+						),
+						rule_applied="task_placed_with_reason",
+						impact_score=0.6,
+					)
+				)
 
-		explanations = [
+		explanations.insert(
+			0,
 			PlanExplanation(
-				message="Tasks ordered by priority and filtered by constraints",
-				rule_applied="priority_and_constraints",
+				message=(
+					f"Planning summary for {schedule_date.isoformat()}: scheduled {len(schedule.items)} task(s), "
+					f"skipped {skipped_count} task(s). Ordering: non-flexible first (rigid scheduling), then higher priority, "
+					"then earlier deadline. Strategy: defer flexible tasks to later slots, remove only as last resort."
+				),
+				rule_applied="planning_summary",
 				impact_score=1.0,
-			)
-		]
+			),
+		)
 		schedule.explanations = explanations
 		self.explanations_by_schedule_id[schedule.schedule_id] = explanations
 		return schedule
+
+	def _find_earliest_slot(
+		self,
+		task: CareTask,
+		schedule_date: date,
+		day_windows: list[AvailabilityWindow],
+		existing_items: list[ScheduleItem],
+	) -> tuple[tuple[datetime, datetime] | None, str]:
+		"""Find the earliest non-overlapping slot and explain the scheduling decision.
+		
+		For flexible tasks: tries to fit within deadline first, then allows overflow past deadline.
+		For non-flexible tasks: must fit within deadline.
+		"""
+		duration = timedelta(minutes=max(task.duration_min, 0))
+		deadline_text = task.latest_end.strftime("%H:%M") if task.latest_end is not None else "end of day"
+		earliest_text = task.earliest_start.strftime("%H:%M") if task.earliest_start is not None else "window start"
+
+		if duration <= timedelta(minutes=0):
+			return None, "task duration is 0 minutes, so there is nothing to schedule"
+
+		failure_reasons: list[str] = []
+
+		for window in day_windows:
+			window_start_time = window.start_time or time(hour=0, minute=0)
+			window_end_time = window.end_time or time(hour=23, minute=59)
+			window_start = datetime.combine(schedule_date, window_start_time)
+			window_end = datetime.combine(schedule_date, window_end_time)
+			if window_end <= window_start:
+				failure_reasons.append(
+					f"availability window {window_start_time.strftime('%H:%M')}-{window_end_time.strftime('%H:%M')} is invalid"
+				)
+				continue
+
+			task_start_bound = window_start
+			if task.earliest_start is not None:
+				task_start_bound = max(task_start_bound, datetime.combine(schedule_date, task.earliest_start))
+
+			# For flexible tasks, allow overflow past deadline; for rigid tasks, enforce deadline
+			task_end_bound = window_end
+			if task.latest_end is not None:
+				task_end_bound = min(task_end_bound, datetime.combine(schedule_date, task.latest_end))
+			
+			deadline_bound = task_end_bound  # Store original deadline bound
+
+			# Try to fit within deadline first
+			if task_end_bound <= task_start_bound or task_start_bound + duration > task_end_bound:
+				available_minutes = int(max((task_end_bound - task_start_bound).total_seconds() // 60, 0))
+				within_deadline_failed = (
+					f"no {task.duration_min}-minute gap available between "
+					f"{task_start_bound.strftime('%H:%M')} and {task_end_bound.strftime('%H:%M')}"
+				)
+				
+				# For flexible tasks, try to fit after deadline but within availability window
+				if task.is_flexible and window_end > deadline_bound:
+					task_end_bound = window_end  # Extend search to end of availability window
+					# Continue to try below with extended bound
+				else:
+					failure_reasons.append(within_deadline_failed)
+					continue
+			else:
+				# Slot fits within deadline, try to find it
+				cursor = task_start_bound
+				last_blocking_item: ScheduleItem | None = None
+				relevant_items = sorted(
+					[
+						item
+						for item in existing_items
+						if item.start_time is not None
+						and item.end_time is not None
+						and item.end_time > task_start_bound
+						and item.start_time < task_end_bound
+					],
+					key=lambda item: item.start_time,
+				)
+
+				for item in relevant_items:
+					if cursor + duration <= item.start_time:
+						reason = (
+							f"scheduled in first open gap before deadline {deadline_text}; "
+							f"starts at {cursor.strftime('%H:%M')} after earliest bound {earliest_text}"
+						)
+						return (cursor, cursor + duration), reason
+					if item.end_time > cursor:
+						cursor = item.end_time
+						last_blocking_item = item
+					if cursor + duration > deadline_bound:  # Use original deadline bound for rigid check
+						break
+
+				if cursor + duration <= deadline_bound:  # Check against original deadline
+					if last_blocking_item and last_blocking_item.end_time is not None:
+						blocking_title = (
+							last_blocking_item.task.title
+							if last_blocking_item.task is not None and last_blocking_item.task.title
+							else "an earlier task"
+						)
+						reason = (
+							f"scheduled after {blocking_title} finished at {last_blocking_item.end_time.strftime('%H:%M')}; "
+							f"still fits before deadline {deadline_text}"
+						)
+					else:
+						reason = (
+							f"scheduled at earliest feasible time {cursor.strftime('%H:%M')} "
+							f"within availability and before deadline {deadline_text}"
+						)
+					return (cursor, cursor + duration), reason
+
+				# Doesn't fit within deadline, try extending for flexible tasks
+				if not task.is_flexible:
+					failure_reasons.append(
+						f"no {task.duration_min}-minute gap available between "
+						f"{task_start_bound.strftime('%H:%M')} and {deadline_bound.strftime('%H:%M')}"
+					)
+					continue
+				
+				task_end_bound = window_end  # Extend to window end for flexible task
+
+			# Attempt to place flexible task after deadline
+			if task.is_flexible:
+				cursor = task_start_bound
+				relevant_items = sorted(
+					[
+						item
+						for item in existing_items
+						if item.start_time is not None
+						and item.end_time is not None
+						and item.end_time > task_start_bound
+						and item.start_time < task_end_bound
+					],
+					key=lambda item: item.start_time,
+				)
+
+				last_blocking_item_extended: ScheduleItem | None = None
+				for item in relevant_items:
+					if cursor + duration <= item.start_time:
+						if cursor >= deadline_bound:
+							reason = (
+								f"flexible task scheduled after deadline {deadline_text} at {cursor.strftime('%H:%M')} "
+								f"(no room before deadline, placed in available gap)"
+							)
+						else:
+							reason = (
+								f"scheduled in first open gap before deadline {deadline_text}; "
+								f"starts at {cursor.strftime('%H:%M')} after earliest bound {earliest_text}"
+							)
+						return (cursor, cursor + duration), reason
+					if item.end_time > cursor:
+						cursor = item.end_time
+						last_blocking_item_extended = item
+					if cursor + duration > task_end_bound:
+						break
+
+				if cursor + duration <= task_end_bound:
+					if cursor >= deadline_bound:
+						reason = (
+							f"flexible task scheduled after deadline {deadline_text} at {cursor.strftime('%H:%M')} "
+							f"(no room before deadline)"
+						)
+					elif last_blocking_item_extended and last_blocking_item_extended.end_time is not None:
+						blocking_title = (
+							last_blocking_item_extended.task.title
+							if last_blocking_item_extended.task is not None and last_blocking_item_extended.task.title
+							else "an earlier task"
+						)
+						reason = (
+							f"scheduled after {blocking_title} finished at {last_blocking_item_extended.end_time.strftime('%H:%M')}; "
+							f"fits within availability window"
+						)
+					else:
+						reason = (
+							f"flexible task scheduled at {cursor.strftime('%H:%M')}; "
+							f"fits within availability window"
+						)
+					return (cursor, cursor + duration), reason
+
+				failure_reasons.append(
+					f"no {task.duration_min}-minute gap available even after deadline {deadline_text}"
+				)
+
+		if not failure_reasons:
+			return None, "no feasible slot found"
+
+		return None, "; ".join(failure_reasons)
+
+	def _try_schedule_with_backtracking(
+		self,
+		task: CareTask,
+		pet_id: UUID,
+		schedule_date: date,
+		day_windows: list[AvailabilityWindow],
+		existing_items: list[ScheduleItem],
+	) -> tuple[tuple[datetime, datetime] | None, str, list[ScheduleItem], list[ScheduleItem]]:
+		"""Try to schedule a task; defer flexible tasks first, then remove lower-priority tasks if needed.
+		
+		Returns:
+			(slot, reason, removed_tasks, deferred_tasks)
+		"""
+		slot, reason = self._find_earliest_slot(task, schedule_date, day_windows, existing_items)
+		if slot is not None:
+			return slot, reason, [], []
+
+		flexible_candidates = sorted(
+			[item for item in existing_items if item.task and item.task.is_flexible and item.task.priority < task.priority],
+			key=lambda item: (item.task.priority if item.task else 0, item.start_time or datetime.min),
+		)
+
+		deferred_items: list[ScheduleItem] = []
+		temp_items = existing_items.copy()
+
+		for candidate in flexible_candidates:
+			temp_items.remove(candidate)
+			deferred_items.append(candidate)
+
+			slot, reason = self._find_earliest_slot(task, schedule_date, day_windows, temp_items)
+			if slot is not None:
+				for deferred in deferred_items:
+					later_slot, _ = self._find_earliest_slot(deferred.task, schedule_date, day_windows, temp_items)
+					if later_slot is not None:
+						d_start, d_end = later_slot
+						deferred.start_time = d_start
+						deferred.end_time = d_end
+						temp_items.append(deferred)
+
+				existing_items.clear()
+				existing_items.extend(temp_items)
+				return slot, reason, [], deferred_items
+
+			temp_items.append(candidate)
+			deferred_items.pop()
+
+		rigid_candidates = sorted(
+			[item for item in existing_items if item.task and not item.task.is_flexible and item.task.priority < task.priority],
+			key=lambda item: (item.task.priority if item.task else 0, item.start_time or datetime.min),
+		)
+
+		removed_items: list[ScheduleItem] = []
+		temp_items = existing_items.copy()
+
+		for candidate in rigid_candidates:
+			temp_items.remove(candidate)
+			removed_items.append(candidate)
+
+			slot, reason = self._find_earliest_slot(task, schedule_date, day_windows, temp_items)
+			if slot is not None:
+				existing_items.clear()
+				existing_items.extend(temp_items)
+				return slot, reason, removed_items, []
+
+			temp_items.append(candidate)
+			removed_items.pop()
+
+		return None, reason, [], []
 
 	def score_task(self, task: CareTask) -> float:
 		"""Calculate a priority score for a task to determine scheduling order.

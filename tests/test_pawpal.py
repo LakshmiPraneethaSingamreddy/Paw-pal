@@ -1,6 +1,6 @@
 from datetime import date, time
 
-from pawpal_system import AvailabilityWindow, CareTask, Pet, PetCareApp, TaskCategory
+from pawpal_system import AvailabilityWindow, CareTask, Frequency, Pet, PetCareApp, TaskCategory
 
 
 def _build_owner_with_pet(app: PetCareApp):
@@ -69,3 +69,251 @@ def test_add_task_increases_pet_task_count():
 	)
 
 	assert len(pet.tasks) == initial_count + 1
+
+
+def test_scheduler_respects_time_windows_for_morning_tasks():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Morning walk",
+			category=TaskCategory.WALKING,
+			duration_min=20,
+			priority=3,
+			frequency=Frequency.DAILY,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Feed breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			frequency=Frequency.DAILY,
+			earliest_start=time(hour=8, minute=30),
+			latest_end=time(hour=9, minute=30),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Playdate",
+			category=TaskCategory.PLAY,
+			duration_min=60,
+			priority=2,
+			frequency=Frequency.CUSTOM,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=30),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Vet appointment",
+			category=TaskCategory.VET,
+			duration_min=120,
+			priority=3,
+			frequency=Frequency.CUSTOM,
+			earliest_start=time(hour=12, minute=0),
+			latest_end=time(hour=14, minute=0),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert schedule.items
+
+	for item in schedule.items:
+		assert item.task is not None
+		assert item.end_time is not None
+		# Non-flexible tasks must respect deadline; flexible tasks can overflow
+		if item.task.latest_end is not None and not item.task.is_flexible:
+			assert item.end_time.time() <= item.task.latest_end
+
+	morning_tasks = {"Morning walk", "Feed breakfast", "Playdate"}
+	for item in schedule.items:
+		if item.task and item.task.title in morning_tasks:
+			assert item.end_time is not None
+			assert item.end_time.time() <= time(hour=10, minute=0)
+
+
+def test_scheduler_provides_specific_decision_explanations():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Breakfast",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=3,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Long Grooming",
+			category=TaskCategory.GROOMING,
+			duration_min=180,
+						is_flexible=False,
+			priority=2,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=9, minute=30),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert schedule.explanations
+
+	messages = [explanation.message for explanation in schedule.explanations]
+	assert any("Placed 'Breakfast'" in message for message in messages)
+	assert any("Skipped 'Long Grooming'" in message for message in messages)
+
+	breakfast_item = next(item for item in schedule.items if item.task and item.task.title == "Breakfast")
+	assert breakfast_item.reason_code != "window_aware_priority"
+	assert breakfast_item.reason_code != ""
+
+
+def test_scheduler_prioritizes_high_priority_over_low_with_backtracking():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Play with mochi",
+			category=TaskCategory.PLAY,
+			duration_min=60,
+			priority=1,
+			is_flexible=True,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="buy mochi ice cream",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=1,
+			is_flexible=True,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="take mochi to vet",
+			category=TaskCategory.VET,
+			duration_min=40,
+			priority=3,
+			is_flexible=False,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=30),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert schedule.items
+
+	scheduled_titles = {item.task.title for item in schedule.items if item.task}
+	assert "take mochi to vet" in scheduled_titles, "High-priority vet task should be scheduled"
+
+	messages = [explanation.message.lower() for explanation in schedule.explanations]
+	assert any("vet" in msg or "defer" in msg for msg in messages), \
+		"Explanations should mention vet task or deferring"
+
+
+def test_scheduler_defers_flexible_tasks_over_removing_them():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Flexible playtime",
+			category=TaskCategory.PLAY,
+			duration_min=60,
+			priority=1,
+			is_flexible=True,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=18, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Crucial vet appointment",
+			category=TaskCategory.VET,
+			duration_min=40,
+			priority=3,
+			is_flexible=False,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert len(schedule.items) == 2, "Both tasks should be scheduled"
+
+	scheduled_titles = [item.task.title if item.task else "" for item in schedule.items]
+	assert "Flexible playtime" in scheduled_titles
+	assert "Crucial vet appointment" in scheduled_titles
+
+	vet_item = next(item for item in schedule.items if item.task and item.task.title == "Crucial vet appointment")
+	play_item = next(item for item in schedule.items if item.task and item.task.title == "Flexible playtime")
+
+	assert vet_item.start_time < play_item.start_time, "Non-flexible vet should be scheduled before flexible playtime"
+
+	messages = [explanation.message.lower() for explanation in schedule.explanations]
+	assert any("defer" in msg for msg in messages), "Should mention deferring flexible tasks"
+
+
+def test_scheduler_non_flexible_tasks_prioritized_in_ordering():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Flexible low-priority task",
+			category=TaskCategory.PLAY,
+			duration_min=30,
+			priority=1,
+			is_flexible=True,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=20, minute=0),
+		),
+	)
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Non-flexible medium-priority task",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=2,
+			is_flexible=False,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, today)
+	assert len(schedule.items) == 2, f"Expected 2 items, got {len(schedule.items)}"
+
+	feeding_item = next((item for item in schedule.items if item.task and item.task.title == "Non-flexible medium-priority task"), None)
+	play_item = next((item for item in schedule.items if item.task and item.task.title == "Flexible low-priority task"), None)
+
+	assert feeding_item is not None, "Non-flexible feeding task should be scheduled"
+	assert play_item is not None, "Flexible play task should be scheduled"
+	assert feeding_item.start_time < play_item.start_time, \
+		"Non-flexible task should be scheduled before flexible task regardless of priority"
