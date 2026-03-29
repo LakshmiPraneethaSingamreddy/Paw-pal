@@ -68,6 +68,48 @@ def test_mark_task_completion_updates_schedule_item_status():
 	assert updated_item.completed_at is not None
 
 
+# Verifies completed tasks remain completed after schedule regeneration on the same date.
+def test_completed_task_persists_after_regeneration_same_date():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	walk_task = CareTask(
+		title="Morning Walk",
+		category=TaskCategory.WALKING,
+		duration_min=30,
+		priority=9,
+		earliest_start=time(hour=7, minute=0),
+		latest_end=time(hour=10, minute=0),
+	)
+	owner.add_task(pet.pet_id, walk_task)
+
+	first_schedule = app.run_daily_planning(owner.owner_id, today)
+	first_walk_item = next(item for item in first_schedule.items if item.task and item.task.task_id == walk_task.task_id)
+	app.mark_task_completion(owner.owner_id, today, first_walk_item.item_id, completed=True)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Lunch Feed",
+			category=TaskCategory.FEEDING,
+			duration_min=20,
+			priority=6,
+			earliest_start=time(hour=12, minute=0),
+			latest_end=time(hour=14, minute=0),
+		),
+	)
+
+	regenerated_schedule = app.run_daily_planning(owner.owner_id, today)
+	regenerated_walk_item = next(
+		item
+		for item in regenerated_schedule.items
+		if item.task and item.task.task_id == walk_task.task_id
+	)
+
+	assert regenerated_walk_item.completed is True
+	assert regenerated_walk_item.completed_at is not None
+
+
 # Verifies adding a task through owner API actually appends to the pet's task list.
 def test_add_task_increases_pet_task_count():
 	app = PetCareApp()
@@ -421,8 +463,8 @@ def test_custom_interval_task_schedules_on_interval_days_only():
 	assert any(item.task and item.task.title == "Custom meds" for item in day_plus_two_schedule.items)
 
 
-# Verifies fallback availability is used when requested weekday lacks explicit windows.
-def test_scheduler_uses_fallback_availability_for_unconfigured_weekday():
+# Verifies schedules are empty when requested weekday has no configured availability.
+def test_scheduler_returns_empty_for_unconfigured_weekday_even_if_other_days_exist():
 	app = PetCareApp()
 	owner, pet, today = _build_owner_with_pet(app)
 
@@ -442,9 +484,9 @@ def test_scheduler_uses_fallback_availability_for_unconfigured_weekday():
 	)
 
 	schedule = app.run_daily_planning(owner.owner_id, next_day)
-	assert any(item.task and item.task.title == "Daily fallback walk" for item in schedule.items)
+	assert not any(item.task and item.task.title == "Daily fallback walk" for item in schedule.items)
 	assert any(
-		explanation.rule_applied == "availability_fallback_window"
+		explanation.rule_applied == "availability_required"
 		for explanation in schedule.explanations
 	)
 

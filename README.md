@@ -22,21 +22,85 @@ Your final app should:
 - Display the plan clearly (and ideally explain the reasoning)
 - Include tests for the most important scheduling behaviors
 
-## Smarter Scheduling
+## Demo
 
-PawPal+ has been enhanced with 5 intelligent features to help pet owners plan more effectively:
+PawPal+ provides an intuitive Streamlit interface for managing pet care across multiple pets with intelligent scheduling:
 
-1. **Task Sorting by Time** — Tasks are automatically sorted chronologically, making it easy to view the day's schedule at a glance.
+**1. Owner Setup & Pet Management**  
 
-2. **Pet & Flexibility Filtering** — Filter tasks by pet or flexibility status (flexible/non-flexible) to focus on specific care categories.
+![Owner Setup & Pet Management](docs/images/01-owner-setup.png)
+Set owner preferences, configure weekly availability windows, and add/manage multiple pets with detailed profiles.
 
-3. **Recurring Tasks** — Define tasks that repeat on DAILY, WEEKLY, or CUSTOM schedules (including multi-day patterns and intervals). The scheduler intelligently expands recurrence patterns before planning.
 
-4. **Conflict Detection** — The app detects and warns about overlapping tasks in the schedule, helping identify potential scheduling issues without auto-resolving them.
+**2. Task Creation & Management** 
 
-5. **Task Completion Tracking** — Mark tasks as complete directly from the schedule view with interactive checkboxes. Completed tasks show with strikethrough styling and completion timestamps for easy tracking of daily progress.
+![Task Creation & Management](docs/images/02-pet-setup.png)
+Create tasks with full recurrence patterns (daily, weekly, custom intervals), specify time windows, priority levels, and flexibility. View, filter, and edit tasks in an organized table.
 
-These features work together to provide a more organized, flexible, and transparent scheduling experience.
+
+**3. Intelligent Daily Scheduling** 
+
+![Daily Scheduling & Execution](docs/images/03-task-management.png)
+Generate schedules that respect owner availability and task constraints. View generated tasks marked as complete with timestamps and conflict detection.
+
+
+**4. Plan Transparency & Explanations** 
+
+![Plan Explanations](docs/images/04-schedule-and-explanations.png)
+Review detailed explanations for every scheduling decision—understand why tasks were placed, deferred, or skipped.
+
+## Features
+
+### Product capabilities
+
+1. **Owner + pet profile management**
+	- Create and edit owner profile settings (timezone, preferences, notification lead).
+	- Add, edit, and remove pets with species and basic physical details.
+
+2. **Task lifecycle management (CRUD)**
+	- Add, edit, and remove care tasks per pet.
+	- Capture category, duration, priority, flexibility, time bounds, and notes.
+
+3. **Recurrence-aware planning**
+	- Support task frequencies: `DAILY`, `WEEKLY`, and `CUSTOM`.
+	- Weekly recurrence uses a target weekday.
+	- Custom recurrence supports selected weekdays or every-N-days interval with an anchor date.
+
+4. **Daily schedule generation + explanations**
+	- Generate a day plan from all pets/tasks for the selected date.
+	- Return schedule explanations describing why tasks were placed, deferred, or skipped.
+
+5. **Interactive schedule execution tracking**
+	- Mark scheduled items complete/incomplete from the UI.
+	- Completion timestamps are recorded and completion state is preserved across same-day schedule regeneration.
+
+6. **Task visibility and conflict awareness**
+	- Filter task views by pet and flexibility.
+	- Sort task lists and scheduled items chronologically for stable display.
+	- Detect overlapping schedule items and show conflict warnings/suggested fixes.
+
+### Scheduling algorithms implemented
+
+1. **Window-aware greedy placement**
+	- Tasks are placed in the earliest feasible non-overlapping slot inside owner availability windows.
+
+2. **Priority + rigidity ordering**
+	- Candidate tasks are ordered with non-flexible tasks first, then higher priority, then tighter time bounds.
+
+3. **Backtracking with deferral/removal strategy**
+	- If no slot is found, the scheduler first defers lower-priority flexible tasks.
+	- If still blocked, it removes lower-priority rigid tasks as a last resort.
+
+4. **Flexible overflow handling**
+	- Flexible tasks may be scheduled after their preferred deadline when no pre-deadline gap exists (but still within availability).
+
+5. **Constraint filtering layer**
+	- Hard constraints are validated against candidate tasks before placement.
+	- Owner preference `avoid_late_night` is enforced during filtering.
+
+6. **Post-processing and observability**
+	- `DailySchedule.regenerate()` validates items, removes invalid entries, and adjusts non-locked overlaps.
+	- Planning summary and per-task reason codes improve explainability/debuggability.
 
 ## Getting started
 

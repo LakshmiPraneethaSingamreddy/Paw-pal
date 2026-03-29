@@ -21,39 +21,40 @@ from pawpal_system import (
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="wide")
 
-st.title("🐾 PawPal+")
+st.markdown("<h1 style='text-align: center;'>🐾 PawPal+</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; font-style: italic; color: #666; margin-top: -10px;'>Where pet care meets perfect planning 🐾</p>", unsafe_allow_html=True)
 
-st.markdown(
-    """
-Welcome to the PawPal+ starter app.
+# st.markdown(
+#     """
+# Welcome to the PawPal+ starter app.
 
-This file is intentionally thin. It gives you a working Streamlit app so you can start quickly,
-but **it does not implement the project logic**. Your job is to design the system and build it.
+# This file is intentionally thin. It gives you a working Streamlit app so you can start quickly,
+# but **it does not implement the project logic**. Your job is to design the system and build it.
 
-Use this app as your interactive demo once your backend classes/functions exist.
-"""
-)
+# Use this app as your interactive demo once your backend classes/functions exist.
+# """
+# )
 
-with st.expander("Scenario", expanded=True):
-    st.markdown(
-        """
-**PawPal+** is a pet care planning assistant. It helps a pet owner plan care tasks
-for their pet(s) based on constraints like time, priority, and preferences.
+# with st.expander("Scenario", expanded=True):
+#     st.markdown(
+#         """
+# **PawPal+** is a pet care planning assistant. It helps a pet owner plan care tasks
+# for their pet(s) based on constraints like time, priority, and preferences.
 
-You will design and implement the scheduling logic and connect it to this Streamlit UI.
-"""
-    )
+# You will design and implement the scheduling logic and connect it to this Streamlit UI.
+# """
+#     )
 
-with st.expander("What you need to build", expanded=True):
-    st.markdown(
-        """
-At minimum, your system should:
-- Represent pet care tasks (what needs to happen, how long it takes, priority)
-- Represent the pet and the owner (basic info and preferences)
-- Build a plan/schedule for a day that chooses and orders tasks based on constraints
-- Explain the plan (why each task was chosen and when it happens)
-"""
-    )
+# with st.expander("What you need to build", expanded=True):
+#     st.markdown(
+#         """
+# At minimum, your system should:
+# - Represent pet care tasks (what needs to happen, how long it takes, priority)
+# - Represent the pet and the owner (basic info and preferences)
+# - Build a plan/schedule for a day that chooses and orders tasks based on constraints
+# - Explain the plan (why each task was chosen and when it happens)
+# """
+#     )
 
 st.divider()
 
@@ -83,6 +84,56 @@ owner = st.session_state.petcare_app.owners_by_id[st.session_state.owner_id]
 owner.name = owner_name
 owner.timezone = timezone
 st.session_state.petcare_app.save_owner_info(owner)
+
+pref_col1, pref_col2 = st.columns(2)
+with pref_col1:
+    max_tasks_per_block = st.number_input("Max tasks per block", min_value=1, max_value=12, value=4)
+    preferred_task_order = st.text_input("Preferred task order", value="high_to_low_priority")
+with pref_col2:
+    st.write("")
+    st.write("")
+    late_night_available = st.checkbox("Late-night tasks allowed (after 10 PM)", value=True)
+    st.write("")
+    notification_lead_min = st.number_input("Notification lead (minutes)", min_value=0, max_value=180, value=15)
+
+st.markdown("### Availability Window")
+available_days = st.multiselect(
+    "Available days",
+    options=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    default=["Mon", "Tue", "Wed", "Thu", "Fri"],
+)
+avail_col1, avail_col2 = st.columns(2)
+with avail_col1:
+    availability_start = st.time_input("Available from", value=time(hour=8, minute=0))
+with avail_col2:
+    availability_end = st.time_input("Available until", value=time(hour=20, minute=0))
+
+day_to_index = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+
+if st.button("Save owner settings"):
+    owner.preference = OwnerPreference(
+        max_tasks_per_block=int(max_tasks_per_block),
+        preferred_task_order=preferred_task_order,
+        avoid_late_night=not late_night_available,
+        notification_lead_min=int(notification_lead_min),
+    )
+    if availability_end <= availability_start:
+        st.error("Availability end time must be after start time.")
+    else:
+        owner.availability_windows = [
+            AvailabilityWindow(
+                day_of_week=day_to_index[day_label],
+                start_time=availability_start,
+                end_time=availability_end,
+            )
+            for day_label in available_days
+        ]
+        st.session_state.petcare_app.save_owner_info(owner)
+        st.success("Owner preferences and availability saved.")
+
+st.divider()
+
+st.subheader("Pets")
 
 existing_pets = owner.pets
 pet_by_id = {pet.pet_id: pet for pet in existing_pets}
@@ -218,48 +269,7 @@ else:
             st.success("Pet deleted.")
             st.rerun()
 
-pref_col1, pref_col2 = st.columns(2)
-with pref_col1:
-    max_tasks_per_block = st.number_input("Max tasks per block", min_value=1, max_value=12, value=4)
-    preferred_task_order = st.text_input("Preferred task order", value="high_to_low_priority")
-with pref_col2:
-    late_night_available = st.checkbox("Late-night tasks allowed (after 10 PM)", value=True)
-    notification_lead_min = st.number_input("Notification lead (minutes)", min_value=0, max_value=180, value=15)
-
-st.markdown("### Availability Window")
-available_days = st.multiselect(
-    "Available days",
-    options=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    default=["Mon", "Tue", "Wed", "Thu", "Fri"],
-)
-avail_col1, avail_col2 = st.columns(2)
-with avail_col1:
-    availability_start = st.time_input("Available from", value=time(hour=8, minute=0))
-with avail_col2:
-    availability_end = st.time_input("Available until", value=time(hour=20, minute=0))
-
-day_to_index = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
-
-if st.button("Save owner settings"):
-    owner.preference = OwnerPreference(
-        max_tasks_per_block=int(max_tasks_per_block),
-        preferred_task_order=preferred_task_order,
-        avoid_late_night=not late_night_available,
-        notification_lead_min=int(notification_lead_min),
-    )
-    if availability_end <= availability_start:
-        st.error("Availability end time must be after start time.")
-    else:
-        owner.availability_windows = [
-            AvailabilityWindow(
-                day_of_week=day_to_index[day_label],
-                start_time=availability_start,
-                end_time=availability_end,
-            )
-            for day_label in available_days
-        ]
-        st.session_state.petcare_app.save_owner_info(owner)
-        st.success("Owner preferences and availability saved.")
+st.divider()
 
 st.markdown("### Tasks")
 st.caption("Add a few tasks. In your final version, these should feed into your scheduler.")
@@ -353,7 +363,63 @@ if st.button("Add task"):
         st.session_state.petcare_app.save_owner_info(owner)
         st.success("Task added.")
 
+st.divider()
+
 st.markdown("### View and Filter Tasks")
+scheduler_service = st.session_state.petcare_app.scheduler_service
+
+
+def _filter_task_pairs_for_display(task_pairs, pet_id=None, flexible_only=None):
+    """Use scheduler helper when available; otherwise apply local fallback filtering."""
+    if hasattr(scheduler_service, "filter_task_pairs_for_display"):
+        return scheduler_service.filter_task_pairs_for_display(
+            task_pairs,
+            pet_id=pet_id,
+            flexible_only=flexible_only,
+        )
+
+    filtered = task_pairs
+    if pet_id is not None:
+        filtered = [(pet, task) for pet, task in filtered if pet.pet_id == pet_id]
+    if flexible_only is None:
+        return filtered
+    return [(pet, task) for pet, task in filtered if task.is_flexible == flexible_only]
+
+
+def _sort_task_pairs_for_display(task_pairs):
+    """Use scheduler helper when available; otherwise apply local fallback sorting."""
+    if hasattr(scheduler_service, "sort_task_pairs_for_display"):
+        return scheduler_service.sort_task_pairs_for_display(task_pairs)
+
+    def _task_display_sort_key(task: CareTask) -> tuple[int, time, int, str]:
+        start = task.earliest_start if task.earliest_start is not None else time(hour=23, minute=59)
+        has_no_start = 1 if task.earliest_start is None else 0
+        return (has_no_start, start, -task.priority, task.title.lower())
+
+    return sorted(task_pairs, key=lambda pair: _task_display_sort_key(pair[1]))
+
+
+def _sort_schedule_items_for_display(items):
+    """Use scheduler helper when available; otherwise apply local fallback sorting."""
+    if hasattr(scheduler_service, "sort_schedule_items_for_display"):
+        return scheduler_service.sort_schedule_items_for_display(items)
+    return sorted(items, key=lambda item: item.start_time or time(hour=23, minute=59))
+
+
+def _get_schedule_conflicts(schedule):
+    """Use scheduler helper when available; otherwise apply local overlap detection."""
+    if hasattr(scheduler_service, "get_schedule_conflicts"):
+        return scheduler_service.get_schedule_conflicts(schedule)
+
+    sorted_items = sorted(
+        [item for item in schedule.items if item.start_time is not None and item.end_time is not None],
+        key=lambda schedule_item: schedule_item.start_time,
+    )
+    conflicts = []
+    for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
+        if previous_item.end_time > current_item.start_time:
+            conflicts.append((previous_item, current_item))
+    return conflicts
 
 # Gather all tasks from all pets with pet name metadata
 all_tasks_with_pets = []
@@ -388,34 +454,25 @@ if all_tasks_with_pets:
             key="task_view_flexibility_filter"
         )
     
-    # Apply filters (display-only, non-mutating)
-    filtered_tasks_with_pets = all_tasks_with_pets.copy()
-    
-    # Pet filter
+    selected_pet_id_filter = None
     if selected_pet_filter != "All Pets":
         selected_pet_idx = pet_filter_options.index(selected_pet_filter) - 1
-        filtered_pet_id = owner.pets[selected_pet_idx].pet_id
-        filtered_tasks_with_pets = [
-            (p, t) for p, t in filtered_tasks_with_pets
-            if p.pet_id == filtered_pet_id
-        ]
-    
-    # Flexibility filter
-    if flexibility_filter == "Flexible Only":
-        filtered_tasks_with_pets = [(p, t) for p, t in filtered_tasks_with_pets if t.is_flexible]
-    elif flexibility_filter == "Non-flexible Only":
-        filtered_tasks_with_pets = [(p, t) for p, t in filtered_tasks_with_pets if not t.is_flexible]
-    
-    # Sort filtered tasks
-    def _task_display_sort_key(task: CareTask) -> tuple[int, time, int, str]:
-        """Sort tasks by start-time presence, start time, priority (desc), then title."""
-        start = task.earliest_start if task.earliest_start is not None else time(hour=23, minute=59)
-        has_no_start = 1 if task.earliest_start is None else 0
-        return (has_no_start, start, -task.priority, task.title.lower())
-    
-    sorted_filtered = sorted(filtered_tasks_with_pets, key=lambda pair: _task_display_sort_key(pair[1]))
-    
-    st.write(f"Current tasks: ({len(sorted_filtered)} showing)")
+        selected_pet_id_filter = owner.pets[selected_pet_idx].pet_id
+
+    flexibility_map = {
+        "All Tasks": None,
+        "Flexible Only": True,
+        "Non-flexible Only": False,
+    }
+    filtered_tasks_with_pets = _filter_task_pairs_for_display(
+        all_tasks_with_pets,
+        pet_id=selected_pet_id_filter,
+        flexible_only=flexibility_map[flexibility_filter],
+    )
+    sorted_filtered = _sort_task_pairs_for_display(filtered_tasks_with_pets)
+
+    st.success(f"Showing {len(sorted_filtered)} task(s) after applying filters.")
+
     if "editing_task_id" not in st.session_state:
         st.session_state.editing_task_id = None
 
@@ -651,19 +708,43 @@ if st.button("Generate schedule"):
         st.error("Add a pet before generating a schedule.")
     elif not owner.availability_windows:
         st.error("Set at least one availability window before generating a schedule.")
+    elif not any(window.day_of_week == schedule_date.weekday() for window in owner.availability_windows):
+        st.session_state.last_schedule = None
+        st.session_state.last_schedule_date = schedule_date
+        st.warning(
+            "No availability is configured for the selected weekday. Add an availability window for that day and try again."
+        )
     else:
         schedule = st.session_state.petcare_app.run_daily_planning(
             owner_id=st.session_state.owner_id,
             schedule_date=schedule_date,
         )
 
+        # Persist latest generated result (including empty schedules) to avoid stale UI.
+        st.session_state.last_schedule = schedule
+        st.session_state.last_schedule_date = schedule_date
+
         if schedule.items:
-            # Store schedule in session state for persistence
-            st.session_state.last_schedule = schedule
-            st.session_state.last_schedule_date = schedule_date
-            st.success(f"Schedule generated for {schedule_date.isoformat()}.")
+            conflicts = _get_schedule_conflicts(schedule)
+            st.success(
+                f"Schedule generated for {schedule_date.isoformat()}: "
+                f"{len(schedule.items)} task(s) planned."
+            )
+            if conflicts:
+                st.warning(
+                    f"{len(conflicts)} conflict(s) detected. Review the conflict table below to adjust overlapping tasks."
+                )
         else:
-            st.warning("No tasks could be scheduled. Check pet tasks and owner availability.")
+            has_no_day_availability = any(
+                explanation.rule_applied == "availability_required"
+                for explanation in schedule.explanations
+            )
+            if has_no_day_availability:
+                st.warning(
+                    "No availability is configured for the selected day. Add an availability window for that weekday and try again."
+                )
+            else:
+                st.warning("No tasks could be scheduled. Check pet tasks and owner availability.")
 
 # Display persisted schedule (either from fresh generation or from session state across reruns)
 if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule is not None:
@@ -673,14 +754,24 @@ if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule
         st.markdown("### Daily Schedule - Mark tasks as complete")
         
         pet_name_by_id = {pet.pet_id: pet.name or "Unnamed" for pet in owner.pets}
+        sorted_schedule_items = _sort_schedule_items_for_display(schedule.items)
+
+        header_cols = st.columns([0.7, 2.3, 1.5, 1.6, 1.0, 1.0, 1.2])
+        header_labels = ["Done", "Task", "Pet", "Time", "Priority", "Flexible", "Status"]
+        for col, label in zip(header_cols, header_labels):
+            with col:
+                st.caption(f"**{label}**")
         
         # Display each task with interactive completion checkbox
-        for item in sorted(schedule.items, key=lambda x: x.start_time or time(hour=23, minute=59)):
-            col1, col2, col3, col4, col5, col6 = st.columns([0.5, 2, 1.5, 1.5, 2, 1])
+        for item in sorted_schedule_items:
+            col1, col2, col3, col4, col5, col6, col7 = st.columns([0.7, 2.3, 1.5, 1.6, 1.0, 1.0, 1.2])
             
             with col1:
                 # Completion checkbox
-                completed_state_key = f"complete_{item.item_id}"
+                task_key_part = str(item.task.task_id) if item.task is not None else str(item.item_id)
+                completed_state_key = (
+                    f"complete_{st.session_state.owner_id}_{schedule_date.isoformat()}_{task_key_part}"
+                )
                 is_completed = st.checkbox(
                     "",
                     value=item.completed,
@@ -716,41 +807,60 @@ if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule
                 st.write(time_str)
             
             with col5:
-                st.write(item.reason_code)
+                st.write(str(item.task.priority) if item.task else "-")
             
             with col6:
-                if item.completed and item.completed_at:
-                    st.caption(f"✓ {item.completed_at.strftime('%H:%M')}")
-                else:
-                    st.caption("")
+                st.write("Yes" if item.task and item.task.is_flexible else "No")
 
-        # Read-only conflict detection: highlight overlaps without modifying the schedule.
-        sorted_items = sorted(
-            [item for item in schedule.items if item.start_time is not None and item.end_time is not None],
-            key=lambda schedule_item: schedule_item.start_time,
-        )
-        conflicts: list[tuple] = []
-        for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
-            if previous_item.end_time > current_item.start_time:
-                conflicts.append((previous_item, current_item))
+            with col7:
+                if item.completed and item.completed_at:
+                    st.caption(f"Done at {item.completed_at.strftime('%H:%M')}")
+                elif item.completed:
+                    st.caption("Done")
+                else:
+                    st.caption("Pending")
+
+        # Read-only conflict detection via scheduler service helper.
+        conflicts = _get_schedule_conflicts(schedule)
 
         if conflicts:
             st.warning(
-                f"Detected {len(conflicts)} schedule conflict(s). The app is only warning here; it does not auto-resolve."
+                f"Detected {len(conflicts)} schedule conflict(s). Focus on moving flexible tasks first to reduce overlap."
             )
             st.markdown("### Conflict details")
+            conflict_rows = []
             for previous_item, current_item in conflicts:
                 previous_task = previous_item.task.title if previous_item.task else "Unknown task"
                 current_task = current_item.task.title if current_item.task else "Unknown task"
                 previous_pet = pet_name_by_id.get(previous_item.pet_id, "Unknown Pet")
                 current_pet = pet_name_by_id.get(current_item.pet_id, "Unknown Pet")
-                st.write(
-                    "- "
-                    f"{previous_pet}: {previous_task} "
-                    f"({previous_item.start_time.strftime('%H:%M')} - {previous_item.end_time.strftime('%H:%M')}) overlaps with "
-                    f"{current_pet}: {current_task} "
-                    f"({current_item.start_time.strftime('%H:%M')} - {current_item.end_time.strftime('%H:%M')})"
+                overlap_minutes = int((previous_item.end_time - current_item.start_time).total_seconds() // 60)
+                suggested_fix = "Move flexible task later"
+                if previous_item.task and current_item.task:
+                    if not previous_item.task.is_flexible and current_item.task.is_flexible:
+                        suggested_fix = f"Move '{current_task}' later"
+                    elif previous_item.task.is_flexible and not current_item.task.is_flexible:
+                        suggested_fix = f"Move '{previous_task}' later"
+                    elif previous_item.task.priority > current_item.task.priority:
+                        suggested_fix = f"Keep '{previous_task}' fixed first"
+                    elif current_item.task.priority > previous_item.task.priority:
+                        suggested_fix = f"Keep '{current_task}' fixed first"
+
+                conflict_rows.append(
+                    {
+                        "Task": f"{previous_pet}: {previous_task}",
+                        "Time": f"{previous_item.start_time.strftime('%H:%M')} - {previous_item.end_time.strftime('%H:%M')}",
+                        "Conflicts With": f"{current_pet}: {current_task}",
+                        "Conflict Time": f"{current_item.start_time.strftime('%H:%M')} - {current_item.end_time.strftime('%H:%M')}",
+                        "Overlap Minutes": overlap_minutes,
+                        "Suggested Fix": suggested_fix,
+                    }
                 )
+
+            st.table(conflict_rows)
+            st.info(
+                "Suggested approach: keep medication/feeding fixed, and shift flexible play or grooming tasks to the next open slot."
+            )
 
         if schedule.explanations:
             st.markdown("### Plan explanation")

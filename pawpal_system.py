@@ -299,9 +299,7 @@ class DailySchedule:
 			if item.start_time is not None and item.end_time is not None
 		)
 
-		if self.status == ScheduleStatus.FINAL:
-			self.status = ScheduleStatus.UPDATED
-		elif self.status == ScheduleStatus.DRAFT:
+		if self.status in (ScheduleStatus.FINAL, ScheduleStatus.DRAFT):
 			self.status = ScheduleStatus.UPDATED
 
 		summary = (
@@ -661,11 +659,7 @@ class SchedulerService:
 		owner: Owner,
 		schedule_date: date,
 	) -> tuple[list[AvailabilityWindow], bool]:
-		"""Return windows for the date, with fallback when weekday coverage is missing.
-
-		If the owner has windows but none for the requested weekday, reuse the earliest
-		configured window as a template for this date.
-		"""
+		"""Return windows configured for the requested schedule weekday only."""
 		matching = [
 			window for window in owner.availability_windows
 			if window.day_of_week == schedule_date.weekday()
@@ -673,20 +667,7 @@ class SchedulerService:
 		if matching:
 			matching.sort(key=lambda window: window.start_time or time(hour=0, minute=0))
 			return matching, False
-
-		if not owner.availability_windows:
-			return [], False
-
-		template = min(
-			owner.availability_windows,
-			key=lambda window: (window.start_time or time(hour=0, minute=0), window.day_of_week),
-		)
-		fallback_window = AvailabilityWindow(
-			day_of_week=schedule_date.weekday(),
-			start_time=template.start_time,
-			end_time=template.end_time,
-		)
-		return [fallback_window], True
+		return [], False
 
 	def generate_daily_schedule(self, owner: Owner, schedule_date: date) -> DailySchedule:
 		"""Generate a daily schedule for all of an owner's pets' tasks.
@@ -706,7 +687,7 @@ class SchedulerService:
 			for task in pet.tasks:
 				all_tasks.append((pet.pet_id, task))
 
-		day_windows, used_fallback_window = self._resolve_day_windows(owner, schedule_date)
+		day_windows, _ = self._resolve_day_windows(owner, schedule_date)
 
 		schedule = DailySchedule(
 			date=schedule_date,
@@ -747,17 +728,6 @@ class SchedulerService:
 		candidate_pairs.sort(key=ordering_key)
 
 		explanations: list[PlanExplanation] = []
-		if used_fallback_window:
-			explanations.append(
-				PlanExplanation(
-					message=(
-						"No explicit availability windows found for this weekday; "
-						"used fallback from the earliest configured availability window."
-					),
-					rule_applied="availability_fallback_window",
-					impact_score=0.5,
-				)
-			)
 		skipped_count = 0
 		for pet_id, task in candidate_pairs:
 			slot, decision_reason, removed_tasks, deferred_tasks = self._try_schedule_with_backtracking(
@@ -888,7 +858,6 @@ class SchedulerService:
 
 			# Try to fit within deadline first
 			if task_end_bound <= task_start_bound or task_start_bound + duration > task_end_bound:
-				available_minutes = int(max((task_end_bound - task_start_bound).total_seconds() // 60, 0))
 				within_deadline_failed = (
 					f"no {task.duration_min}-minute gap available between "
 					f"{task_start_bound.strftime('%H:%M')} and {task_end_bound.strftime('%H:%M')}"
@@ -1160,6 +1129,63 @@ class SchedulerService:
 		"""
 		return self.explanations_by_schedule_id.get(schedule_id, [])
 
+	def filter_task_pairs_for_display(
+		self,
+		task_pairs: list[tuple[Pet, CareTask]],
+		pet_id: UUID | None = None,
+		flexible_only: bool | None = None,
+	) -> list[tuple[Pet, CareTask]]:
+		"""Filter task pairs for UI display without mutating source data.
+
+		Args:
+			task_pairs: List of (pet, task) tuples to filter.
+			pet_id: Optional pet ID to include only one pet's tasks.
+			flexible_only: None for all tasks, True for flexible tasks,
+				False for non-flexible tasks only.
+
+		Returns:
+			Filtered list of (pet, task) tuples.
+		"""
+		filtered = task_pairs
+		if pet_id is not None:
+			filtered = [(pet, task) for pet, task in filtered if pet.pet_id == pet_id]
+
+		if flexible_only is None:
+			return filtered
+
+		return [(pet, task) for pet, task in filtered if task.is_flexible == flexible_only]
+
+	def sort_task_pairs_for_display(self, task_pairs: list[tuple[Pet, CareTask]]) -> list[tuple[Pet, CareTask]]:
+		"""Return task pairs sorted for readable table display.
+
+		Ordering: tasks with explicit start time first, then start time,
+		higher priority first, then title alphabetically.
+		"""
+		def sort_key(pair: tuple[Pet, CareTask]) -> tuple[int, time, int, str]:
+			task = pair[1]
+			start = task.earliest_start if task.earliest_start is not None else time(hour=23, minute=59)
+			has_no_start = 1 if task.earliest_start is None else 0
+			return (has_no_start, start, -task.priority, task.title.lower())
+
+		return sorted(task_pairs, key=sort_key)
+
+	def sort_schedule_items_for_display(self, items: list[ScheduleItem]) -> list[ScheduleItem]:
+		"""Sort scheduled items by start time for stable display order."""
+		return sorted(items, key=lambda item: item.start_time or datetime.min)
+
+	def get_schedule_conflicts(self, schedule: DailySchedule) -> list[tuple[ScheduleItem, ScheduleItem]]:
+		"""Return overlapping schedule item pairs for warning display."""
+		sorted_items = [
+			item
+			for item in self.sort_schedule_items_for_display(schedule.items)
+			if item.start_time is not None and item.end_time is not None
+		]
+		conflicts: list[tuple[ScheduleItem, ScheduleItem]] = []
+		for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
+			if previous_item.end_time > current_item.start_time:
+				conflicts.append((previous_item, current_item))
+		return conflicts
+
 
 class PetCareApp:
 	"""Main application for managing pet care and scheduling.
@@ -1178,6 +1204,7 @@ class PetCareApp:
 		self.scheduler_service = SchedulerService()
 		self.owners_by_id: dict[UUID, Owner] = {}
 		self.schedules_by_owner_date: dict[tuple[UUID, date], DailySchedule] = {}
+		self.task_completion_by_owner_date: dict[tuple[UUID, date, UUID], datetime | None] = {}
 
 	def create_owner_profile(self) -> Owner:
 		"""Create a new owner profile and register it with the application.
@@ -1229,7 +1256,30 @@ class PetCareApp:
 		if owner is None:
 			raise ValueError("Owner not found")
 
+		# Preserve completion state for tasks that remain after regeneration.
+		previous_schedule = self.schedules_by_owner_date.get((owner_id, schedule_date))
+
 		schedule = self.scheduler_service.generate_daily_schedule(owner, schedule_date)
+
+		if previous_schedule is not None:
+			for previous_item in previous_schedule.items:
+				if previous_item.task is None:
+					continue
+				completion_key = (owner_id, schedule_date, previous_item.task.task_id)
+				if previous_item.completed:
+					self.task_completion_by_owner_date[completion_key] = previous_item.completed_at
+				else:
+					self.task_completion_by_owner_date.pop(completion_key, None)
+
+		for item in schedule.items:
+			if item.task is None:
+				continue
+			completion_key = (owner_id, schedule_date, item.task.task_id)
+			completed_at = self.task_completion_by_owner_date.get(completion_key)
+			if completion_key in self.task_completion_by_owner_date:
+				item.completed = True
+				item.completed_at = completed_at
+
 		self.schedules_by_owner_date[(owner_id, schedule_date)] = schedule
 		owner.schedules_by_date[schedule_date] = schedule
 		return schedule
@@ -1258,3 +1308,13 @@ class PetCareApp:
 		if schedule is None:
 			raise ValueError("Schedule not found")
 		schedule.mark_item_completion(item_id=item_id, completed=completed, when=when)
+
+		for item in schedule.items:
+			if item.item_id != item_id or item.task is None:
+				continue
+			completion_key = (owner_id, schedule_date, item.task.task_id)
+			if completed:
+				self.task_completion_by_owner_date[completion_key] = item.completed_at
+			else:
+				self.task_completion_by_owner_date.pop(completion_key, None)
+			break
