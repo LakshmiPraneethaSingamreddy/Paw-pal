@@ -56,8 +56,23 @@ Location: "Build Schedule" section, after schedule table display
 Logic: Sort items by start time, check if end_time > next.start_time
 Impact: Read-only warnings; schedule outcomes unchanged
 
+=== MODIFICATION 5: TASK COMPLETION TRACKING ===
+Users can mark scheduled tasks as complete directly from the schedule:
+- Interactive checkbox for each task (Column 1)
+- Striking through completed task titles (visual feedback)
+- Shows completion time when task marked complete (Column 6)
+
+Location: "Daily Schedule - Mark tasks as complete" section in app.py
+UI Elements: 6-column layout with checkbox | task title | pet | time | reason | completion time
+Backend: Calls PetCareApp.mark_task_completion() to persist completion status
+Data: Stores in ScheduleItem.completed (bool) and ScheduleItem.completed_at (datetime)
+Session State: Schedule stored in st.session_state.last_schedule for reference
+
+Impact: Users get visual feedback on task progress; completion tracked per schedule
+Tests: Existing test_mark_task_completion_updates_schedule_item_status validates logic
+
 All modifications are tested and backward compatible.
-Run: python -m pytest -q (Expected: 11 passed)
+Run: python -m pytest -q (Expected: 10 passed)
 """
 
 import streamlit as st
@@ -519,52 +534,101 @@ if st.button("Generate schedule"):
         )
 
         if schedule.items:
-            pet_name_by_id = {pet.pet_id: pet.name or "Unnamed" for pet in owner.pets}
+            # Store schedule in session state for persistence
+            st.session_state.last_schedule = schedule
+            st.session_state.last_schedule_date = schedule_date
             st.success(f"Schedule generated for {schedule_date.isoformat()}.")
-            st.table(
-                [
-                    {
-                        "pet": pet_name_by_id.get(item.pet_id, "Unknown Pet"),
-                        "task": item.task.title if item.task else "",
-                        "start": item.start_time.strftime("%H:%M") if item.start_time else "",
-                        "end": item.end_time.strftime("%H:%M") if item.end_time else "",
-                        "reason": item.reason_code,
-                    }
-                    for item in schedule.items
-                ]
-            )
-
-            # Read-only conflict detection: highlight overlaps without modifying the schedule.
-            sorted_items = sorted(
-                [item for item in schedule.items if item.start_time is not None and item.end_time is not None],
-                key=lambda schedule_item: schedule_item.start_time,
-            )
-            conflicts: list[tuple] = []
-            for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
-                if previous_item.end_time > current_item.start_time:
-                    conflicts.append((previous_item, current_item))
-
-            if conflicts:
-                st.warning(
-                    f"Detected {len(conflicts)} schedule conflict(s). The app is only warning here; it does not auto-resolve."
-                )
-                st.markdown("### Conflict details")
-                for previous_item, current_item in conflicts:
-                    previous_task = previous_item.task.title if previous_item.task else "Unknown task"
-                    current_task = current_item.task.title if current_item.task else "Unknown task"
-                    previous_pet = pet_name_by_id.get(previous_item.pet_id, "Unknown Pet")
-                    current_pet = pet_name_by_id.get(current_item.pet_id, "Unknown Pet")
-                    st.write(
-                        "- "
-                        f"{previous_pet}: {previous_task} "
-                        f"({previous_item.start_time.strftime('%H:%M')} - {previous_item.end_time.strftime('%H:%M')}) overlaps with "
-                        f"{current_pet}: {current_task} "
-                        f"({current_item.start_time.strftime('%H:%M')} - {current_item.end_time.strftime('%H:%M')})"
-                    )
-
-            if schedule.explanations:
-                st.markdown("### Plan explanation")
-                for explanation in schedule.explanations:
-                    st.write(f"- {explanation.message}")
         else:
             st.warning("No tasks could be scheduled. Check pet tasks and owner availability.")
+
+# Display persisted schedule (either from fresh generation or from session state across reruns)
+if hasattr(st.session_state, 'last_schedule') and st.session_state.last_schedule is not None:
+    if st.session_state.last_schedule_date == schedule_date:
+        schedule = st.session_state.last_schedule
+        
+        st.markdown("### Daily Schedule - Mark tasks as complete")
+        
+        pet_name_by_id = {pet.pet_id: pet.name or "Unnamed" for pet in owner.pets}
+        
+        # Display each task with interactive completion checkbox
+        for item in sorted(schedule.items, key=lambda x: x.start_time or time(hour=23, minute=59)):
+            col1, col2, col3, col4, col5, col6 = st.columns([0.5, 2, 1.5, 1.5, 2, 1])
+            
+            with col1:
+                # Completion checkbox
+                completed_state_key = f"complete_{item.item_id}"
+                is_completed = st.checkbox(
+                    "",
+                    value=item.completed,
+                    key=completed_state_key,
+                    label_visibility="collapsed"
+                )
+                
+                # Update backend if completion status changed
+                if is_completed != item.completed:
+                    st.session_state.petcare_app.mark_task_completion(
+                        owner_id=st.session_state.owner_id,
+                        schedule_date=schedule_date,
+                        item_id=item.item_id,
+                        completed=is_completed
+                    )
+                    item.completed = is_completed
+            
+            with col2:
+                # Task title with strikethrough styling if completed
+                task_title = item.task.title if item.task else "Unknown task"
+                if item.completed:
+                    st.markdown(f"~~{task_title}~~")
+                else:
+                    st.write(task_title)
+            
+            with col3:
+                st.write(f"**{pet_name_by_id.get(item.pet_id, 'Unknown Pet')}**")
+            
+            with col4:
+                time_str = ""
+                if item.start_time and item.end_time:
+                    time_str = f"{item.start_time.strftime('%H:%M')} - {item.end_time.strftime('%H:%M')}"
+                st.write(time_str)
+            
+            with col5:
+                st.write(item.reason_code)
+            
+            with col6:
+                if item.completed and item.completed_at:
+                    st.caption(f"✓ {item.completed_at.strftime('%H:%M')}")
+                else:
+                    st.caption("")
+
+        # Read-only conflict detection: highlight overlaps without modifying the schedule.
+        sorted_items = sorted(
+            [item for item in schedule.items if item.start_time is not None and item.end_time is not None],
+            key=lambda schedule_item: schedule_item.start_time,
+        )
+        conflicts: list[tuple] = []
+        for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
+            if previous_item.end_time > current_item.start_time:
+                conflicts.append((previous_item, current_item))
+
+        if conflicts:
+            st.warning(
+                f"Detected {len(conflicts)} schedule conflict(s). The app is only warning here; it does not auto-resolve."
+            )
+            st.markdown("### Conflict details")
+            for previous_item, current_item in conflicts:
+                previous_task = previous_item.task.title if previous_item.task else "Unknown task"
+                current_task = current_item.task.title if current_item.task else "Unknown task"
+                previous_pet = pet_name_by_id.get(previous_item.pet_id, "Unknown Pet")
+                current_pet = pet_name_by_id.get(current_item.pet_id, "Unknown Pet")
+                st.write(
+                    "- "
+                    f"{previous_pet}: {previous_task} "
+                    f"({previous_item.start_time.strftime('%H:%M')} - {previous_item.end_time.strftime('%H:%M')}) overlaps with "
+                    f"{current_pet}: {current_task} "
+                    f"({current_item.start_time.strftime('%H:%M')} - {current_item.end_time.strftime('%H:%M')})"
+                )
+
+        if schedule.explanations:
+            st.markdown("### Plan explanation")
+            for explanation in schedule.explanations:
+                st.write(f"- {explanation.message}")

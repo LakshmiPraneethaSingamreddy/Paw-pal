@@ -24,7 +24,7 @@ Your final app should:
 
 ## Smarter Scheduling
 
-PawPal+ has been enhanced with 4 intelligent features to help pet owners plan more effectively:
+PawPal+ has been enhanced with 5 intelligent features to help pet owners plan more effectively:
 
 1. **Task Sorting by Time** — Tasks are automatically sorted chronologically, making it easy to view the day's schedule at a glance.
 
@@ -33,6 +33,8 @@ PawPal+ has been enhanced with 4 intelligent features to help pet owners plan mo
 3. **Recurring Tasks** — Define tasks that repeat on DAILY, WEEKLY, or CUSTOM schedules (including multi-day patterns and intervals). The scheduler intelligently expands recurrence patterns before planning.
 
 4. **Conflict Detection** — The app detects and warns about overlapping tasks in the schedule, helping identify potential scheduling issues without auto-resolving them.
+
+5. **Task Completion Tracking** — Mark tasks as complete directly from the schedule view with interactive checkboxes. Completed tasks show with strikethrough styling and completion timestamps for easy tracking of daily progress.
 
 These features work together to provide a more organized, flexible, and transparent scheduling experience. See `app.py` docstring for implementation details.
 
