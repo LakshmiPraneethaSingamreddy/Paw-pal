@@ -1,4 +1,4 @@
-from datetime import date, time
+from datetime import date, time, timedelta
 
 from pawpal_system import AvailabilityWindow, CareTask, Frequency, Pet, PetCareApp, TaskCategory
 
@@ -317,3 +317,100 @@ def test_scheduler_non_flexible_tasks_prioritized_in_ordering():
 	assert play_item is not None, "Flexible play task should be scheduled"
 	assert feeding_item.start_time < play_item.start_time, \
 		"Non-flexible task should be scheduled before flexible task regardless of priority"
+
+
+def test_weekly_task_schedules_only_on_matching_weekday():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Weekly grooming",
+			category=TaskCategory.GROOMING,
+			duration_min=30,
+			priority=2,
+			frequency=Frequency.WEEKLY,
+			weekly_day_of_week=today.weekday(),
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=12, minute=0),
+		),
+	)
+
+	today_schedule = app.run_daily_planning(owner.owner_id, today)
+	assert any(item.task and item.task.title == "Weekly grooming" for item in today_schedule.items)
+
+	next_day = today + timedelta(days=1)
+	next_day_schedule = app.run_daily_planning(owner.owner_id, next_day)
+	assert not any(item.task and item.task.title == "Weekly grooming" for item in next_day_schedule.items)
+
+
+def test_custom_interval_task_schedules_on_interval_days_only():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+	owner.availability_windows.append(
+		AvailabilityWindow(
+			day_of_week=(today + timedelta(days=1)).weekday(),
+			start_time=time(hour=6, minute=0),
+			end_time=time(hour=22, minute=0),
+		)
+	)
+	owner.availability_windows.append(
+		AvailabilityWindow(
+			day_of_week=(today + timedelta(days=2)).weekday(),
+			start_time=time(hour=6, minute=0),
+			end_time=time(hour=22, minute=0),
+		)
+	)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Custom meds",
+			category=TaskCategory.MEDICATION,
+			duration_min=15,
+			priority=3,
+			frequency=Frequency.CUSTOM,
+			custom_interval_days=2,
+			custom_anchor_date=today,
+			earliest_start=time(hour=9, minute=0),
+			latest_end=time(hour=11, minute=0),
+		),
+	)
+
+	today_schedule = app.run_daily_planning(owner.owner_id, today)
+	assert any(item.task and item.task.title == "Custom meds" for item in today_schedule.items)
+
+	day_plus_one_schedule = app.run_daily_planning(owner.owner_id, today + timedelta(days=1))
+	assert not any(item.task and item.task.title == "Custom meds" for item in day_plus_one_schedule.items)
+
+	day_plus_two_schedule = app.run_daily_planning(owner.owner_id, today + timedelta(days=2))
+	assert any(item.task and item.task.title == "Custom meds" for item in day_plus_two_schedule.items)
+
+
+def test_scheduler_uses_fallback_availability_for_unconfigured_weekday():
+	app = PetCareApp()
+	owner, pet, today = _build_owner_with_pet(app)
+
+	# Only today's weekday is configured by helper. Schedule for next day should still work.
+	next_day = today + timedelta(days=1)
+
+	owner.add_task(
+		pet.pet_id,
+		CareTask(
+			title="Daily fallback walk",
+			category=TaskCategory.WALKING,
+			duration_min=20,
+			priority=2,
+			frequency=Frequency.DAILY,
+			earliest_start=time(hour=8, minute=0),
+			latest_end=time(hour=10, minute=0),
+		),
+	)
+
+	schedule = app.run_daily_planning(owner.owner_id, next_day)
+	assert any(item.task and item.task.title == "Daily fallback walk" for item in schedule.items)
+	assert any(
+		explanation.rule_applied == "availability_fallback_window"
+		for explanation in schedule.explanations
+	)

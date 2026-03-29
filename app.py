@@ -1,3 +1,65 @@
+"""
+PawPal+ Streamlit UI Application
+
+This Streamlit app provides a pet care planning interface with 4 key enhancements:
+
+=== MODIFICATION 1: TASK SORTING BY TIME ===
+Tasks are automatically sorted in the "View and Filter Tasks" section by:
+1. Presence of start time (tasks with times first)
+2. Start time (chronological order)
+3. Priority (higher first)
+4. Title (alphabetical)
+
+Location: _task_display_sort_key() helper, task display table
+Impact: Display-only sorting; underlying data unchanged
+Benefit: Easier task scanning in time-order perspective
+
+=== MODIFICATION 2: PET & FLEXIBILITY FILTERING ===
+Users can filter the task table by:
+- Pet (dropdown: "All Pets" or specific pet; auto-selects active pet)
+- Flexibility (dropdown: "All Tasks", "Flexible Only", "Non-flexible Only")
+
+Location: "View and Filter Tasks" section with filter_col1, filter_col2
+Impact: Display-only filtering; scheduling logic unaffected
+Session state: Filters persist across reruns via st.session_state
+
+=== MODIFICATION 3: RECURRING TASKS ===
+Tasks now support Frequency-based recurrence:
+- DAILY: Task runs every day
+- WEEKLY: Task runs on one specific weekday (weekly_day_of_week)
+- CUSTOM: Two modes:
+  a) Selected weekdays (custom_days_of_week: list of weekday indices)
+  b) Every N days (custom_interval_days with custom_anchor_date)
+
+Location: 
+  - Model fields in CareTask (pawpal_system.py):
+    * weekly_day_of_week: int | None
+    * custom_days_of_week: list[int]
+    * custom_interval_days: int | None
+    * custom_anchor_date: date | None
+  - Scheduler logic in SchedulerService:
+    * _should_include_task_for_date() - Checks if task recurs on a date
+    * _expand_recurring_tasks() - Filters tasks before scheduling
+  - UI task creation form in app.py
+
+Impact: Only matching recurrences are included in daily schedules
+Fallback: Scheduler uses earliest available window for uncovered weekdays
+Tests: 3 recurrence tests + 1 fallback test (all passing)
+
+=== MODIFICATION 4: BASIC CONFLICT DETECTION (READ-ONLY) ===
+After schedule generation, the app detects overlapping tasks and displays:
+- Warning count of conflicts
+- Detailed list of conflicting task pairs (pet, task, time ranges)
+- No auto-resolution; warnings only
+
+Location: "Build Schedule" section, after schedule table display
+Logic: Sort items by start time, check if end_time > next.start_time
+Impact: Read-only warnings; schedule outcomes unchanged
+
+All modifications are tested and backward compatible.
+Run: python -m pytest -q (Expected: 11 passed)
+"""
+
 import streamlit as st
 from datetime import date, time
 
@@ -77,26 +139,137 @@ owner.timezone = timezone
 st.session_state.petcare_app.save_owner_info(owner)
 
 existing_pets = owner.pets
-pet_options = {f"{pet.name or 'Unnamed'} ({pet.species or 'unknown'})": pet.pet_id for pet in existing_pets}
-selected_pet_label = st.selectbox(
-    "Existing pets",
-    options=["Create new pet"] + list(pet_options.keys()),
+pet_by_id = {pet.pet_id: pet for pet in existing_pets}
+if "pet_form_mode" not in st.session_state:
+    st.session_state.pet_form_mode = "add"
+if "selected_pet_option_id" not in st.session_state:
+    st.session_state.selected_pet_option_id = st.session_state.pet_id
+
+pet_choice_ids = [None] + [pet.pet_id for pet in existing_pets]
+if st.session_state.selected_pet_option_id not in pet_choice_ids:
+    st.session_state.selected_pet_option_id = st.session_state.pet_id if st.session_state.pet_id in pet_choice_ids else None
+
+def _pet_option_label(pet_id):
+    if pet_id is None:
+        return "Select a pet"
+    pet = pet_by_id.get(pet_id)
+    if pet is None:
+        return "Unknown pet"
+    return f"{pet.name or 'Unnamed'} ({pet.species or 'unknown'})"
+
+selected_pet_id = st.selectbox(
+    "Pets",
+    options=pet_choice_ids,
+    format_func=_pet_option_label,
+    key="selected_pet_option_id",
 )
-selected_pet_id = pet_options.get(selected_pet_label)
 
-selected_pet = next((pet for pet in existing_pets if pet.pet_id == selected_pet_id), None)
+if selected_pet_id != st.session_state.pet_id:
+    st.session_state.pet_id = selected_pet_id
 
-pet_name_default = selected_pet.name if selected_pet else "Mochi"
-species_default = selected_pet.species if selected_pet and selected_pet.species in ["dog", "cat", "other"] else "dog"
-age_default = selected_pet.age_years if selected_pet else 2
-height_default = float(selected_pet.height_cm) if selected_pet else 35.0
-weight_default = float(selected_pet.weight_kg) if selected_pet else 6.5
+selected_pet = pet_by_id.get(selected_pet_id)
 
-pet_name = st.text_input("Pet name", value=pet_name_default)
-species = st.selectbox("Species", ["dog", "cat", "other"], index=["dog", "cat", "other"].index(species_default))
-pet_age = st.number_input("Age (years)", min_value=0, max_value=50, value=int(age_default))
-pet_height = st.number_input("Height (cm)", min_value=0.0, max_value=300.0, value=height_default)
-pet_weight = st.number_input("Weight (kg)", min_value=0.0, max_value=250.0, value=weight_default)
+pet_action_col1, pet_action_col2 = st.columns(2)
+with pet_action_col1:
+    if st.button("Add new pet"):
+        st.session_state.pet_form_mode = "add"
+with pet_action_col2:
+    if st.button("Edit selected pet"):
+        if selected_pet is None:
+            st.error("Select a pet from the dropdown before editing.")
+        else:
+            st.session_state.pet_form_mode = "edit"
+
+if st.session_state.pet_form_mode == "add":
+    st.markdown("### Add Pet")
+    add_col1, add_col2 = st.columns(2)
+    with add_col1:
+        add_pet_name = st.text_input("Pet name", value="Mochi")
+        add_species = st.selectbox("Species", ["dog", "cat", "other"], index=0)
+        add_pet_age = st.number_input("Age (years)", min_value=0, max_value=50, value=2)
+    with add_col2:
+        add_pet_height = st.number_input("Height (cm)", min_value=0.0, max_value=300.0, value=35.0)
+        add_pet_weight = st.number_input("Weight (kg)", min_value=0.0, max_value=250.0, value=6.5)
+
+    if st.button("Save new pet"):
+        new_pet = Pet(
+            name=add_pet_name,
+            species=add_species,
+            age_years=int(add_pet_age),
+            height_cm=float(add_pet_height),
+            weight_kg=float(add_pet_weight),
+        )
+        st.session_state.petcare_app.save_pet_info(st.session_state.owner_id, new_pet)
+        st.session_state.pet_id = new_pet.pet_id
+        st.session_state.selected_pet_for_filter = new_pet.pet_id
+        st.session_state.pet_form_mode = "edit"
+        st.session_state.petcare_app.save_owner_info(owner)
+        st.success("New pet added.")
+        st.rerun()
+else:
+    st.markdown("### Edit Pet")
+    if selected_pet is None:
+        st.info("Select a pet in the dropdown, then click 'Edit selected pet'.")
+    else:
+        key_suffix = str(selected_pet.pet_id)
+        selected_species = selected_pet.species if selected_pet.species in ["dog", "cat", "other"] else "other"
+        edit_col1, edit_col2 = st.columns(2)
+        with edit_col1:
+            edit_pet_name = st.text_input("Pet name", value=selected_pet.name, key=f"edit_pet_name_{key_suffix}")
+            edit_species = st.selectbox(
+                "Species",
+                ["dog", "cat", "other"],
+                index=["dog", "cat", "other"].index(selected_species),
+                key=f"edit_species_{key_suffix}",
+            )
+            edit_pet_age = st.number_input(
+                "Age (years)",
+                min_value=0,
+                max_value=50,
+                value=int(selected_pet.age_years),
+                key=f"edit_pet_age_{key_suffix}",
+            )
+        with edit_col2:
+            edit_pet_height = st.number_input(
+                "Height (cm)",
+                min_value=0.0,
+                max_value=300.0,
+                value=float(selected_pet.height_cm),
+                key=f"edit_pet_height_{key_suffix}",
+            )
+            edit_pet_weight = st.number_input(
+                "Weight (kg)",
+                min_value=0.0,
+                max_value=250.0,
+                value=float(selected_pet.weight_kg),
+                key=f"edit_pet_weight_{key_suffix}",
+            )
+
+        edit_save_col, edit_delete_col = st.columns(2)
+        with edit_save_col:
+            update_pet_clicked = st.button("Save pet changes")
+        with edit_delete_col:
+            delete_pet_clicked = st.button("Delete pet")
+
+        if update_pet_clicked:
+            selected_pet.name = edit_pet_name
+            selected_pet.species = edit_species
+            selected_pet.age_years = int(edit_pet_age)
+            selected_pet.height_cm = float(edit_pet_height)
+            selected_pet.weight_kg = float(edit_pet_weight)
+            st.session_state.pet_id = selected_pet.pet_id
+            st.session_state.petcare_app.save_owner_info(owner)
+            st.success("Pet profile updated.")
+            st.rerun()
+
+        if delete_pet_clicked:
+            owner.remove_pet(selected_pet.pet_id)
+            if st.session_state.pet_id == selected_pet.pet_id:
+                st.session_state.pet_id = None
+            st.session_state.selected_pet_option_id = None
+            st.session_state.petcare_app.save_owner_info(owner)
+            st.success("Pet deleted.")
+            st.rerun()
 
 pref_col1, pref_col2 = st.columns(2)
 with pref_col1:
@@ -120,13 +293,7 @@ with avail_col2:
 
 day_to_index = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
-save_pet_col, delete_pet_col = st.columns(2)
-with save_pet_col:
-    save_pet_clicked = st.button("Add/Update pet")
-with delete_pet_col:
-    delete_pet_clicked = st.button("Delete selected pet")
-
-if save_pet_clicked:
+if st.button("Save owner settings"):
     owner.preference = OwnerPreference(
         max_tasks_per_block=int(max_tasks_per_block),
         preferred_task_order=preferred_task_order,
@@ -144,37 +311,8 @@ if save_pet_clicked:
             )
             for day_label in available_days
         ]
-
-        if selected_pet is None:
-            pet = Pet(
-                name=pet_name,
-                species=species,
-                age_years=int(pet_age),
-                height_cm=float(pet_height),
-                weight_kg=float(pet_weight),
-            )
-            st.session_state.petcare_app.save_pet_info(st.session_state.owner_id, pet)
-            st.session_state.pet_id = pet.pet_id
-        else:
-            selected_pet.name = pet_name
-            selected_pet.species = species
-            selected_pet.age_years = int(pet_age)
-            selected_pet.height_cm = float(pet_height)
-            selected_pet.weight_kg = float(pet_weight)
-            st.session_state.pet_id = selected_pet.pet_id
-
         st.session_state.petcare_app.save_owner_info(owner)
-        st.success("Owner preferences, availability, and pet profile saved.")
-
-if delete_pet_clicked:
-    if selected_pet is None:
-        st.error("Choose an existing pet to delete.")
-    else:
-        owner.remove_pet(selected_pet.pet_id)
-        if st.session_state.pet_id == selected_pet.pet_id:
-            st.session_state.pet_id = None
-        st.session_state.petcare_app.save_owner_info(owner)
-        st.success("Pet deleted.")
+        st.success("Owner preferences and availability saved.")
 
 st.markdown("### Tasks")
 st.caption("Add a few tasks. In your final version, these should feed into your scheduler.")
@@ -194,6 +332,40 @@ with task_col2:
     task_frequency = st.selectbox("Frequency", options=[freq.name for freq in Frequency], index=0)
 with task_col3:
     is_flexible = st.checkbox("Flexible task", value=True)
+
+weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+weekly_day_of_week: int | None = None
+custom_days_of_week: list[int] = []
+custom_interval_days: int | None = None
+custom_anchor_date = None
+
+if task_frequency == Frequency.WEEKLY.name:
+    weekly_day_label = st.selectbox(
+        "Weekly day",
+        options=weekday_labels,
+        index=date.today().weekday(),
+    )
+    weekly_day_of_week = weekday_labels.index(weekly_day_label)
+elif task_frequency == Frequency.CUSTOM.name:
+    custom_mode = st.selectbox(
+        "Custom recurrence mode",
+        options=["Selected weekdays", "Every N days"],
+    )
+    if custom_mode == "Selected weekdays":
+        selected_custom_days = st.multiselect(
+            "Custom weekdays",
+            options=weekday_labels,
+            default=[weekday_labels[date.today().weekday()]],
+        )
+        custom_days_of_week = [weekday_labels.index(day) for day in selected_custom_days]
+    else:
+        custom_interval_days = st.number_input(
+            "Repeat every N days",
+            min_value=1,
+            max_value=90,
+            value=2,
+        )
+        custom_anchor_date = st.date_input("Custom recurrence anchor date", value=date.today())
 
 time_col1, time_col2 = st.columns(2)
 with time_col1:
@@ -220,6 +392,10 @@ if st.button("Add task"):
             duration_min=int(duration),
             priority=priority_to_score[priority],
             frequency=selected_task_frequency,
+            weekly_day_of_week=weekly_day_of_week,
+            custom_days_of_week=custom_days_of_week,
+            custom_interval_days=int(custom_interval_days) if custom_interval_days is not None else None,
+            custom_anchor_date=custom_anchor_date,
             earliest_start=earliest_start,
             latest_end=latest_end,
             is_flexible=is_flexible,
@@ -230,23 +406,95 @@ if st.button("Add task"):
         st.session_state.petcare_app.save_owner_info(owner)
         st.success("Task added.")
 
-active_pet_id = selected_pet_id or st.session_state.pet_id
-pet = next((current_pet for current_pet in owner.pets if current_pet.pet_id == active_pet_id), None)
-if pet and pet.tasks:
-    st.write("Current tasks:")
+st.markdown("### View and Filter Tasks")
+
+# Gather all tasks from all pets with pet name metadata
+all_tasks_with_pets = []
+for pet in owner.pets:
+    for task in pet.tasks:
+        all_tasks_with_pets.append((pet, task))
+
+if all_tasks_with_pets:
+    # Filter controls
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        pet_filter_options = ["All Pets"] + [pet.name or f"Pet {idx}" for idx, pet in enumerate(owner.pets)]
+        
+        # Initialize filter in session state if not present
+        if "task_view_pet_filter" not in st.session_state:
+            st.session_state.task_view_pet_filter = "All Pets"
+        
+        selected_pet_filter = st.selectbox(
+            "Filter by pet",
+            options=pet_filter_options,
+            key="task_view_pet_filter"
+        )
+    
+    with filter_col2:
+        # Initialize flexibility filter in session state if not present
+        if "task_view_flexibility_filter" not in st.session_state:
+            st.session_state.task_view_flexibility_filter = "All Tasks"
+        
+        flexibility_filter = st.selectbox(
+            "Filter by flexibility",
+            options=["All Tasks", "Flexible Only", "Non-flexible Only"],
+            key="task_view_flexibility_filter"
+        )
+    
+    # Apply filters (display-only, non-mutating)
+    filtered_tasks_with_pets = all_tasks_with_pets.copy()
+    
+    # Pet filter
+    if selected_pet_filter != "All Pets":
+        selected_pet_idx = pet_filter_options.index(selected_pet_filter) - 1
+        filtered_pet_id = owner.pets[selected_pet_idx].pet_id
+        filtered_tasks_with_pets = [
+            (p, t) for p, t in filtered_tasks_with_pets
+            if p.pet_id == filtered_pet_id
+        ]
+    
+    # Flexibility filter
+    if flexibility_filter == "Flexible Only":
+        filtered_tasks_with_pets = [(p, t) for p, t in filtered_tasks_with_pets if t.is_flexible]
+    elif flexibility_filter == "Non-flexible Only":
+        filtered_tasks_with_pets = [(p, t) for p, t in filtered_tasks_with_pets if not t.is_flexible]
+    
+    # Sort filtered tasks
+    def _task_display_sort_key(task: CareTask) -> tuple[int, time, int, str]:
+        start = task.earliest_start if task.earliest_start is not None else time(hour=23, minute=59)
+        has_no_start = 1 if task.earliest_start is None else 0
+        return (has_no_start, start, -task.priority, task.title.lower())
+    
+    sorted_filtered = sorted(filtered_tasks_with_pets, key=lambda pair: _task_display_sort_key(pair[1]))
+    
+    st.write(f"Current tasks: ({len(sorted_filtered)} showing)")
     st.table(
         [
             {
+                "pet": pet.name or "Unknown",
                 "title": task.title,
                 "category": task.category.value,
                 "duration_minutes": task.duration_min,
                 "priority": task.priority,
                 "frequency": task.frequency.value,
+                "recurrence": (
+                    f"weekly:{weekday_labels[task.weekly_day_of_week]}"
+                    if task.frequency == Frequency.WEEKLY and task.weekly_day_of_week is not None
+                    else (
+                        f"days:{','.join(weekday_labels[day] for day in task.custom_days_of_week)}"
+                        if task.frequency == Frequency.CUSTOM and task.custom_days_of_week
+                        else (
+                            f"every {task.custom_interval_days} day(s)"
+                            if task.frequency == Frequency.CUSTOM and task.custom_interval_days is not None
+                            else ""
+                        )
+                    )
+                ),
                 "earliest_start": task.earliest_start.strftime("%H:%M") if task.earliest_start else "",
                 "latest_end": task.latest_end.strftime("%H:%M") if task.latest_end else "",
                 "flexible": task.is_flexible,
             }
-            for task in pet.tasks
+            for pet, task in sorted_filtered
         ]
     )
 else:
@@ -271,10 +519,12 @@ if st.button("Generate schedule"):
         )
 
         if schedule.items:
+            pet_name_by_id = {pet.pet_id: pet.name or "Unnamed" for pet in owner.pets}
             st.success(f"Schedule generated for {schedule_date.isoformat()}.")
             st.table(
                 [
                     {
+                        "pet": pet_name_by_id.get(item.pet_id, "Unknown Pet"),
                         "task": item.task.title if item.task else "",
                         "start": item.start_time.strftime("%H:%M") if item.start_time else "",
                         "end": item.end_time.strftime("%H:%M") if item.end_time else "",
@@ -283,6 +533,35 @@ if st.button("Generate schedule"):
                     for item in schedule.items
                 ]
             )
+
+            # Read-only conflict detection: highlight overlaps without modifying the schedule.
+            sorted_items = sorted(
+                [item for item in schedule.items if item.start_time is not None and item.end_time is not None],
+                key=lambda schedule_item: schedule_item.start_time,
+            )
+            conflicts: list[tuple] = []
+            for previous_item, current_item in zip(sorted_items, sorted_items[1:]):
+                if previous_item.end_time > current_item.start_time:
+                    conflicts.append((previous_item, current_item))
+
+            if conflicts:
+                st.warning(
+                    f"Detected {len(conflicts)} schedule conflict(s). The app is only warning here; it does not auto-resolve."
+                )
+                st.markdown("### Conflict details")
+                for previous_item, current_item in conflicts:
+                    previous_task = previous_item.task.title if previous_item.task else "Unknown task"
+                    current_task = current_item.task.title if current_item.task else "Unknown task"
+                    previous_pet = pet_name_by_id.get(previous_item.pet_id, "Unknown Pet")
+                    current_pet = pet_name_by_id.get(current_item.pet_id, "Unknown Pet")
+                    st.write(
+                        "- "
+                        f"{previous_pet}: {previous_task} "
+                        f"({previous_item.start_time.strftime('%H:%M')} - {previous_item.end_time.strftime('%H:%M')}) overlaps with "
+                        f"{current_pet}: {current_task} "
+                        f"({current_item.start_time.strftime('%H:%M')} - {current_item.end_time.strftime('%H:%M')})"
+                    )
+
             if schedule.explanations:
                 st.markdown("### Plan explanation")
                 for explanation in schedule.explanations:

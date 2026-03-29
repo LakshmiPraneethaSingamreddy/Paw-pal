@@ -112,6 +112,11 @@ class CareTask:
 	duration_min: int = 0
 	priority: int = 0
 	frequency: Frequency = Frequency.DAILY
+	created_on: date = field(default_factory=date.today)
+	weekly_day_of_week: int | None = None
+	custom_days_of_week: list[int] = field(default_factory=list)
+	custom_interval_days: int | None = None
+	custom_anchor_date: date | None = None
 	earliest_start: time | None = None
 	latest_end: time | None = None
 	is_flexible: bool = True
@@ -605,6 +610,84 @@ class SchedulerService:
 		self.constraints = constraints or []
 		self.explanations_by_schedule_id: dict[UUID, list[PlanExplanation]] = {}
 
+	def _should_include_task_for_date(self, task: CareTask, schedule_date: date) -> bool:
+		"""Return whether this task recurs on the given schedule date."""
+		weekday = schedule_date.weekday()
+
+		if task.frequency == Frequency.DAILY:
+			return True
+
+		if task.frequency == Frequency.WEEKLY:
+			target_weekday = task.weekly_day_of_week
+			if target_weekday is None:
+				target_weekday = task.created_on.weekday()
+			return weekday == target_weekday
+
+		if task.frequency == Frequency.CUSTOM:
+			if task.custom_days_of_week:
+				return weekday in task.custom_days_of_week
+
+			if task.custom_interval_days is not None and task.custom_anchor_date is not None:
+				if task.custom_interval_days <= 0:
+					return False
+				delta_days = (schedule_date - task.custom_anchor_date).days
+				return delta_days >= 0 and delta_days % task.custom_interval_days == 0
+
+			# Backward compatibility: CUSTOM tasks with no explicit rule still run daily.
+			return True
+
+		return True
+
+	def _expand_recurring_tasks(
+		self,
+		task_pairs: list[tuple[UUID, CareTask]],
+		schedule_date: date,
+	) -> tuple[list[tuple[UUID, CareTask]], int]:
+		"""Filter tasks to those that recur on schedule_date.
+
+		Returns a tuple of (included_task_pairs, recurrence_skipped_count).
+		"""
+		included: list[tuple[UUID, CareTask]] = []
+		skipped = 0
+		for pet_id, task in task_pairs:
+			if self._should_include_task_for_date(task, schedule_date):
+				included.append((pet_id, task))
+			else:
+				skipped += 1
+		return included, skipped
+
+	def _resolve_day_windows(
+		self,
+		owner: Owner,
+		schedule_date: date,
+	) -> tuple[list[AvailabilityWindow], bool]:
+		"""Return windows for the date, with fallback when weekday coverage is missing.
+
+		If the owner has windows but none for the requested weekday, reuse the earliest
+		configured window as a template for this date.
+		"""
+		matching = [
+			window for window in owner.availability_windows
+			if window.day_of_week == schedule_date.weekday()
+		]
+		if matching:
+			matching.sort(key=lambda window: window.start_time or time(hour=0, minute=0))
+			return matching, False
+
+		if not owner.availability_windows:
+			return [], False
+
+		template = min(
+			owner.availability_windows,
+			key=lambda window: (window.start_time or time(hour=0, minute=0), window.day_of_week),
+		)
+		fallback_window = AvailabilityWindow(
+			day_of_week=schedule_date.weekday(),
+			start_time=template.start_time,
+			end_time=template.end_time,
+		)
+		return [fallback_window], True
+
 	def generate_daily_schedule(self, owner: Owner, schedule_date: date) -> DailySchedule:
 		"""Generate a daily schedule for all of an owner's pets' tasks.
 		
@@ -623,10 +706,7 @@ class SchedulerService:
 			for task in pet.tasks:
 				all_tasks.append((pet.pet_id, task))
 
-		day_windows = sorted(
-			[window for window in owner.availability_windows if window.day_of_week == schedule_date.weekday()],
-			key=lambda window: window.start_time or time(hour=0, minute=0),
-		)
+		day_windows, used_fallback_window = self._resolve_day_windows(owner, schedule_date)
 
 		schedule = DailySchedule(
 			date=schedule_date,
@@ -644,8 +724,10 @@ class SchedulerService:
 			self.explanations_by_schedule_id[schedule.schedule_id] = schedule.explanations
 			return schedule
 
+		expanded_pairs, recurrence_skipped = self._expand_recurring_tasks(all_tasks, schedule_date)
+
 		filtered_tasks = self.apply_constraints(
-			[t for _, t in all_tasks],
+			[t for _, t in expanded_pairs],
 			owner,
 			schedule_date,
 		)
@@ -659,12 +741,23 @@ class SchedulerService:
 
 		candidate_pairs = [
 			(pet_id, task)
-			for pet_id, task in all_tasks
+			for pet_id, task in expanded_pairs
 			if task.task_id in filtered_task_ids
 		]
 		candidate_pairs.sort(key=ordering_key)
 
 		explanations: list[PlanExplanation] = []
+		if used_fallback_window:
+			explanations.append(
+				PlanExplanation(
+					message=(
+						"No explicit availability windows found for this weekday; "
+						"used fallback from the earliest configured availability window."
+					),
+					rule_applied="availability_fallback_window",
+					impact_score=0.5,
+				)
+			)
 		skipped_count = 0
 		for pet_id, task in candidate_pairs:
 			slot, decision_reason, removed_tasks, deferred_tasks = self._try_schedule_with_backtracking(
@@ -738,6 +831,7 @@ class SchedulerService:
 			PlanExplanation(
 				message=(
 					f"Planning summary for {schedule_date.isoformat()}: scheduled {len(schedule.items)} task(s), "
+					f"skipped {recurrence_skipped} task(s) by recurrence rules, "
 					f"skipped {skipped_count} task(s). Ordering: non-flexible first (rigid scheduling), then higher priority, "
 					"then earlier deadline. Strategy: defer flexible tasks to later slots, remove only as last resort."
 				),
@@ -1025,9 +1119,7 @@ class SchedulerService:
 		Returns:
 			A list of filtered and sorted tasks ready for scheduling.
 		"""
-		day_windows = [
-			window for window in owner.availability_windows if window.day_of_week == schedule_date.weekday()
-		]
+		day_windows, _ = self._resolve_day_windows(owner, schedule_date)
 
 		if not day_windows:
 			return []

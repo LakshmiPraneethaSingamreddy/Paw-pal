@@ -22,6 +22,20 @@ Your final app should:
 - Display the plan clearly (and ideally explain the reasoning)
 - Include tests for the most important scheduling behaviors
 
+## Smarter Scheduling
+
+PawPal+ has been enhanced with 4 intelligent features to help pet owners plan more effectively:
+
+1. **Task Sorting by Time** — Tasks are automatically sorted chronologically, making it easy to view the day's schedule at a glance.
+
+2. **Pet & Flexibility Filtering** — Filter tasks by pet or flexibility status (flexible/non-flexible) to focus on specific care categories.
+
+3. **Recurring Tasks** — Define tasks that repeat on DAILY, WEEKLY, or CUSTOM schedules (including multi-day patterns and intervals). The scheduler intelligently expands recurrence patterns before planning.
+
+4. **Conflict Detection** — The app detects and warns about overlapping tasks in the schedule, helping identify potential scheduling issues without auto-resolving them.
+
+These features work together to provide a more organized, flexible, and transparent scheduling experience. See `app.py` docstring for implementation details.
+
 ## Getting started
 
 ### Setup
