@@ -1,78 +1,9 @@
-"""
-PawPal+ Streamlit UI Application
+"""PawPal+ Streamlit UI for owner/pet setup, task management, and daily scheduling.
 
-This Streamlit app provides a pet care planning interface with 4 key enhancements:
-
-=== MODIFICATION 1: TASK SORTING BY TIME ===
-Tasks are automatically sorted in the "View and Filter Tasks" section by:
-1. Presence of start time (tasks with times first)
-2. Start time (chronological order)
-3. Priority (higher first)
-4. Title (alphabetical)
-
-Location: _task_display_sort_key() helper, task display table
-Impact: Display-only sorting; underlying data unchanged
-Benefit: Easier task scanning in time-order perspective
-
-=== MODIFICATION 2: PET & FLEXIBILITY FILTERING ===
-Users can filter the task table by:
-- Pet (dropdown: "All Pets" or specific pet; auto-selects active pet)
-- Flexibility (dropdown: "All Tasks", "Flexible Only", "Non-flexible Only")
-
-Location: "View and Filter Tasks" section with filter_col1, filter_col2
-Impact: Display-only filtering; scheduling logic unaffected
-Session state: Filters persist across reruns via st.session_state
-
-=== MODIFICATION 3: RECURRING TASKS ===
-Tasks now support Frequency-based recurrence:
-- DAILY: Task runs every day
-- WEEKLY: Task runs on one specific weekday (weekly_day_of_week)
-- CUSTOM: Two modes:
-  a) Selected weekdays (custom_days_of_week: list of weekday indices)
-  b) Every N days (custom_interval_days with custom_anchor_date)
-
-Location: 
-  - Model fields in CareTask (pawpal_system.py):
-    * weekly_day_of_week: int | None
-    * custom_days_of_week: list[int]
-    * custom_interval_days: int | None
-    * custom_anchor_date: date | None
-  - Scheduler logic in SchedulerService:
-    * _should_include_task_for_date() - Checks if task recurs on a date
-    * _expand_recurring_tasks() - Filters tasks before scheduling
-  - UI task creation form in app.py
-
-Impact: Only matching recurrences are included in daily schedules
-Fallback: Scheduler uses earliest available window for uncovered weekdays
-Tests: 3 recurrence tests + 1 fallback test (all passing)
-
-=== MODIFICATION 4: BASIC CONFLICT DETECTION (READ-ONLY) ===
-After schedule generation, the app detects overlapping tasks and displays:
-- Warning count of conflicts
-- Detailed list of conflicting task pairs (pet, task, time ranges)
-- No auto-resolution; warnings only
-
-Location: "Build Schedule" section, after schedule table display
-Logic: Sort items by start time, check if end_time > next.start_time
-Impact: Read-only warnings; schedule outcomes unchanged
-
-=== MODIFICATION 5: TASK COMPLETION TRACKING ===
-Users can mark scheduled tasks as complete directly from the schedule:
-- Interactive checkbox for each task (Column 1)
-- Striking through completed task titles (visual feedback)
-- Shows completion time when task marked complete (Column 6)
-
-Location: "Daily Schedule - Mark tasks as complete" section in app.py
-UI Elements: 6-column layout with checkbox | task title | pet | time | reason | completion time
-Backend: Calls PetCareApp.mark_task_completion() to persist completion status
-Data: Stores in ScheduleItem.completed (bool) and ScheduleItem.completed_at (datetime)
-Session State: Schedule stored in st.session_state.last_schedule for reference
-
-Impact: Users get visual feedback on task progress; completion tracked per schedule
-Tests: Existing test_mark_task_completion_updates_schedule_item_status validates logic
-
-All modifications are tested and backward compatible.
-Run: python -m pytest -q (Expected: 10 passed)
+This app now supports filtered and time-sorted task views, inline task edit/remove actions,
+and recurrence-aware task creation (daily, weekly, and custom patterns).
+It also persists generated schedules in session state, lets owners mark tasks complete,
+and shows read-only conflict warnings when scheduled items overlap.
 """
 
 import streamlit as st
@@ -88,7 +19,7 @@ from pawpal_system import (
     TaskCategory,
 )
 
-st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
+st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="wide")
 
 st.title("🐾 PawPal+")
 
@@ -165,6 +96,7 @@ if st.session_state.selected_pet_option_id not in pet_choice_ids:
     st.session_state.selected_pet_option_id = st.session_state.pet_id if st.session_state.pet_id in pet_choice_ids else None
 
 def _pet_option_label(pet_id):
+    """Return a readable dropdown label for pet selection options."""
     if pet_id is None:
         return "Select a pet"
     pet = pet_by_id.get(pet_id)
@@ -476,6 +408,7 @@ if all_tasks_with_pets:
     
     # Sort filtered tasks
     def _task_display_sort_key(task: CareTask) -> tuple[int, time, int, str]:
+        """Sort tasks by start-time presence, start time, priority (desc), then title."""
         start = task.earliest_start if task.earliest_start is not None else time(hour=23, minute=59)
         has_no_start = 1 if task.earliest_start is None else 0
         return (has_no_start, start, -task.priority, task.title.lower())
@@ -483,35 +416,226 @@ if all_tasks_with_pets:
     sorted_filtered = sorted(filtered_tasks_with_pets, key=lambda pair: _task_display_sort_key(pair[1]))
     
     st.write(f"Current tasks: ({len(sorted_filtered)} showing)")
-    st.table(
-        [
-            {
-                "pet": pet.name or "Unknown",
-                "title": task.title,
-                "category": task.category.value,
-                "duration_minutes": task.duration_min,
-                "priority": task.priority,
-                "frequency": task.frequency.value,
-                "recurrence": (
-                    f"weekly:{weekday_labels[task.weekly_day_of_week]}"
-                    if task.frequency == Frequency.WEEKLY and task.weekly_day_of_week is not None
-                    else (
-                        f"days:{','.join(weekday_labels[day] for day in task.custom_days_of_week)}"
-                        if task.frequency == Frequency.CUSTOM and task.custom_days_of_week
-                        else (
-                            f"every {task.custom_interval_days} day(s)"
-                            if task.frequency == Frequency.CUSTOM and task.custom_interval_days is not None
-                            else ""
-                        )
+    if "editing_task_id" not in st.session_state:
+        st.session_state.editing_task_id = None
+
+    priority_to_label = {1: "low", 2: "medium", 3: "high"}
+    label_to_priority = {"low": 1, "medium": 2, "high": 3}
+
+    header_cols = st.columns([1.2, 1.8, 1.0, 0.8, 0.9, 0.9, 1.6, 0.9, 0.8, 0.9, 1.1, 1.3])
+    header_labels = [
+        "Pet",
+        "Title",
+        "Category",
+        "Mins",
+        "Priority",
+        "Freq",
+        "Recurrence",
+        "Start",
+        "End",
+        "Flexible",
+        "Edit",
+        "Remove",
+    ]
+    for col, label in zip(header_cols, header_labels):
+        with col:
+            st.caption(f"**{label}**")
+
+    for pet, task in sorted_filtered:
+        recurrence_text = (
+            f"weekly:{weekday_labels[task.weekly_day_of_week]}"
+            if task.frequency == Frequency.WEEKLY and task.weekly_day_of_week is not None
+            else (
+                f"{','.join(weekday_labels[day] for day in task.custom_days_of_week)}"
+                if task.frequency == Frequency.CUSTOM and task.custom_days_of_week
+                else (
+                    f"every {task.custom_interval_days} day(s)"
+                    if task.frequency == Frequency.CUSTOM and task.custom_interval_days is not None
+                    else ""
+                )
+            )
+        )
+
+        row_cols = st.columns([1.2, 1.8, 1.0, 0.8, 0.9, 0.9, 1.6, 0.9, 0.8, 0.9, 1.1, 1.3])
+        with row_cols[0]:
+            st.write(pet.name or "Unknown")
+        with row_cols[1]:
+            st.write(task.title)
+        with row_cols[2]:
+            st.write(task.category.value)
+        with row_cols[3]:
+            st.write(str(task.duration_min))
+        with row_cols[4]:
+            st.write(str(task.priority))
+        with row_cols[5]:
+            st.write(task.frequency.value)
+        with row_cols[6]:
+            st.write(recurrence_text or "-")
+        with row_cols[7]:
+            st.write(task.earliest_start.strftime("%H:%M") if task.earliest_start else "-")
+        with row_cols[8]:
+            st.write(task.latest_end.strftime("%H:%M") if task.latest_end else "-")
+        with row_cols[9]:
+            st.write("Yes" if task.is_flexible else "No")
+        with row_cols[10]:
+            if st.button("Edit", key=f"task_row_edit_{task.task_id}"):
+                st.session_state.editing_task_id = str(task.task_id)
+                st.rerun()
+        with row_cols[11]:
+            if st.button("Remove", key=f"task_row_remove_{task.task_id}"):
+                owner.remove_task(task.task_id)
+                st.session_state.petcare_app.save_owner_info(owner)
+                if st.session_state.editing_task_id == str(task.task_id):
+                    st.session_state.editing_task_id = None
+                st.success(f"Removed task '{task.title}'.")
+                st.rerun()
+
+        if st.session_state.editing_task_id == str(task.task_id):
+            st.markdown(f"Edit task: **{task.title}**")
+
+            edit_col1, edit_col2, edit_col3 = st.columns(3)
+            with edit_col1:
+                edit_task_title = st.text_input("Task title", value=task.title, key=f"edit_task_title_{task.task_id}")
+            with edit_col2:
+                edit_duration = st.number_input(
+                    "Duration (minutes)",
+                    min_value=1,
+                    max_value=240,
+                    value=int(task.duration_min),
+                    key=f"edit_duration_{task.task_id}",
+                )
+            with edit_col3:
+                edit_priority = st.selectbox(
+                    "Priority",
+                    ["low", "medium", "high"],
+                    index=["low", "medium", "high"].index(priority_to_label.get(task.priority, "medium")),
+                    key=f"edit_priority_{task.task_id}",
+                )
+
+            edit_meta_col1, edit_meta_col2, edit_meta_col3 = st.columns(3)
+            with edit_meta_col1:
+                edit_task_category = st.selectbox(
+                    "Category",
+                    options=[category.name for category in TaskCategory],
+                    index=[category.name for category in TaskCategory].index(task.category.name),
+                    key=f"edit_category_{task.task_id}",
+                )
+            with edit_meta_col2:
+                edit_task_frequency = st.selectbox(
+                    "Frequency",
+                    options=[freq.name for freq in Frequency],
+                    index=[freq.name for freq in Frequency].index(task.frequency.name),
+                    key=f"edit_frequency_{task.task_id}",
+                )
+            with edit_meta_col3:
+                edit_is_flexible = st.checkbox(
+                    "Flexible task",
+                    value=task.is_flexible,
+                    key=f"edit_is_flexible_{task.task_id}",
+                )
+
+            edit_weekly_day_of_week: int | None = None
+            edit_custom_days_of_week: list[int] = []
+            edit_custom_interval_days: int | None = None
+            edit_custom_anchor_date = None
+
+            if edit_task_frequency == Frequency.WEEKLY.name:
+                edit_weekly_day_label = st.selectbox(
+                    "Weekly day",
+                    options=weekday_labels,
+                    index=task.weekly_day_of_week if task.weekly_day_of_week is not None else date.today().weekday(),
+                    key=f"edit_weekly_day_of_week_{task.task_id}",
+                )
+                edit_weekly_day_of_week = weekday_labels.index(edit_weekly_day_label)
+            elif edit_task_frequency == Frequency.CUSTOM.name:
+                default_custom_mode = "Every N days" if task.custom_interval_days is not None else "Selected weekdays"
+                edit_custom_mode = st.selectbox(
+                    "Custom recurrence mode",
+                    options=["Selected weekdays", "Every N days"],
+                    index=["Selected weekdays", "Every N days"].index(default_custom_mode),
+                    key=f"edit_custom_mode_{task.task_id}",
+                )
+                if edit_custom_mode == "Selected weekdays":
+                    default_custom_days = (
+                        [weekday_labels[day] for day in task.custom_days_of_week]
+                        if task.custom_days_of_week
+                        else [weekday_labels[date.today().weekday()]]
                     )
-                ),
-                "earliest_start": task.earliest_start.strftime("%H:%M") if task.earliest_start else "",
-                "latest_end": task.latest_end.strftime("%H:%M") if task.latest_end else "",
-                "flexible": task.is_flexible,
-            }
-            for pet, task in sorted_filtered
-        ]
-    )
+                    selected_custom_days = st.multiselect(
+                        "Custom weekdays",
+                        options=weekday_labels,
+                        default=default_custom_days,
+                        key=f"edit_custom_days_of_week_{task.task_id}",
+                    )
+                    edit_custom_days_of_week = [weekday_labels.index(day) for day in selected_custom_days]
+                else:
+                    edit_custom_interval_days = st.number_input(
+                        "Repeat every N days",
+                        min_value=1,
+                        max_value=90,
+                        value=int(task.custom_interval_days or 2),
+                        key=f"edit_custom_interval_days_{task.task_id}",
+                    )
+                    edit_custom_anchor_date = st.date_input(
+                        "Custom recurrence anchor date",
+                        value=task.custom_anchor_date or date.today(),
+                        key=f"edit_custom_anchor_date_{task.task_id}",
+                    )
+
+            edit_time_col1, edit_time_col2 = st.columns(2)
+            with edit_time_col1:
+                edit_earliest_start = st.time_input(
+                    "Earliest start",
+                    value=task.earliest_start or time(hour=8, minute=0),
+                    key=f"edit_earliest_start_{task.task_id}",
+                )
+            with edit_time_col2:
+                edit_latest_end = st.time_input(
+                    "Latest end",
+                    value=task.latest_end or time(hour=20, minute=0),
+                    key=f"edit_latest_end_{task.task_id}",
+                )
+
+            edit_task_notes = st.text_area("Task notes", value=task.notes, key=f"edit_task_notes_{task.task_id}")
+
+            action_col1, action_col2 = st.columns(2)
+            with action_col1:
+                save_edit_clicked = st.button("Save changes", key=f"save_task_edit_{task.task_id}")
+            with action_col2:
+                cancel_edit_clicked = st.button("Cancel", key=f"cancel_task_edit_{task.task_id}")
+
+            if cancel_edit_clicked:
+                st.session_state.editing_task_id = None
+                st.rerun()
+
+            if save_edit_clicked:
+                if edit_latest_end <= edit_earliest_start:
+                    st.error("Task latest end must be after earliest start.")
+                elif edit_task_frequency == Frequency.CUSTOM.name and edit_custom_interval_days is None and not edit_custom_days_of_week:
+                    st.error("Select at least one custom weekday or use interval mode.")
+                else:
+                    owner.edit_task(
+                        task.task_id,
+                        title=edit_task_title,
+                        category=TaskCategory[edit_task_category],
+                        duration_min=int(edit_duration),
+                        priority=label_to_priority[edit_priority],
+                        frequency=Frequency[edit_task_frequency],
+                        weekly_day_of_week=edit_weekly_day_of_week,
+                        custom_days_of_week=edit_custom_days_of_week,
+                        custom_interval_days=int(edit_custom_interval_days) if edit_custom_interval_days is not None else None,
+                        custom_anchor_date=edit_custom_anchor_date,
+                        earliest_start=edit_earliest_start,
+                        latest_end=edit_latest_end,
+                        is_flexible=edit_is_flexible,
+                        notes=edit_task_notes,
+                    )
+                    st.session_state.petcare_app.save_owner_info(owner)
+                    st.session_state.editing_task_id = None
+                    st.success(f"Updated task '{edit_task_title}'.")
+                    st.rerun()
+
+        st.divider()
 else:
     st.info("No tasks yet. Add one above.")
 
